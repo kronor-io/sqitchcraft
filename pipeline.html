@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shipping safely · sqitchcraft</title>
+<meta name="description" content="Why a 50 ms lock timeout prevents outages, how psql-retry deploys through it, and what to check before a commit, on a pull request and before a deploy.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html" aria-current="page">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>
+      <li><a href="#locks">The queue behind a lock</a></li>
+      <li><a href="#retry">Deploying with psql-retry</a></li>
+      <li><a href="#precommit">Before a commit</a></li>
+      <li><a href="#ci">On a pull request</a></li>
+      <li><a href="#compat">Before a deploy</a></li>
+      <li><a href="#order">The deploy</a></li>
+      <li><a href="#drift">Drift</a></li>
+      <li><a href="#limits">What the checks do not prove</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>Shipping safely</h1>
+    <p class="lede">Most migration outages are not caused by the change itself. They are caused by what the change waits for, and everything that then waits behind it. This page starts there, and then sets out what to check, when.</p>
+
+    <h2 id="locks">The queue behind a lock</h2>
+    <p>Picture a reporting query that holds a transaction open on <code>billing.invoice</code> for a few seconds. A migration starts: <code>alter table billing.invoice add column note text</code>. It needs an <code>ACCESS EXCLUSIVE</code> lock, which conflicts with the report's, so it waits. That part is fine.</p>
+    <p>Then a customer checks out, and the checkout reads the invoice table. Its lock does not conflict with the report's at all. But PostgreSQL grants locks in order, and the <code>alter</code> is ahead in the queue. So the checkout waits too. So does every query on that table after it, for as long as the report runs.</p>
+    <p>Here it is on the example database, three sessions, captured from <code>pg_stat_activity</code>:</p>
+<pre data-lang="plain"> session   | waiting_on | query
+-----------+------------+---------------------------------------------------
+ report    | Timeout    | begin; select count(*) from billing.invoice; selec
+<span class="w"> migration | Lock       | alter table billing.invoice add column note text
+ checkout  | Lock       | select count(*) from billing.invoice</span></pre>
+    <p>The <code>alter</code> itself would take a millisecond. The outage is the wait. On a busy table, a few seconds of it means a pile of connections, timeouts in the application, and a pager going off.</p>
+    <p>The fix is to make the migration give up quickly:</p>
+<pre data-lang="shell"><span class="p">$ </span>psql -c "set lock_timeout to '50ms'" -c "alter table billing.invoice add column note2 text"
+SET
+ERROR:  canceling statement due to lock timeout</pre>
+    <p>After 50&nbsp;ms in the queue the <code>alter</code> leaves it, and the checkout behind it goes through. Every create-migration template starts with that setting, and sqiff's migrations do too when they use the templates.</p>
+    <div class="callout warn">
+      <p><code>lock_timeout</code> limits how long a statement <em>waits</em> for a lock. Once it has the lock, it holds it until the transaction ends. A table rewrite that gets its lock in 10&nbsp;ms still blocks the table for as long as the rewrite takes. That is why sqiff prints hazards and sqint reports rewrites: the timeout cannot help with those.</p>
+    </div>
+
+    <h2 id="retry">Deploying with psql-retry</h2>
+    <p>A migration that gives up has not failed; it has found a bad moment. The right response is to wait a little and try again, from outside the database. Retrying inside PL/pgSQL with an <code>exception</code> block opens a subtransaction per attempt, which brings its own problems on a busy server.</p>
+    <p><a href="tools.html#psql-retry">psql-retry</a> runs psql, and when the output says <code>canceling statement due to lock timeout</code>, runs it again, with jittered backoff starting at 10&nbsp;ms and capped at a minute, up to 500 times. Any other error stops it at once. Here is the same report holding its lock for three seconds, and the migration run through psql-retry:</p>
+<pre data-lang="shell"><span class="p">$ </span>PSQL_ARGS="-v ON_ERROR_STOP=1 -f add_note.sql" psql-retry
+SET
+psql:add_note.sql:2: ERROR:  canceling statement due to lock timeout
+Retrying [2 / 500]
+SET
+psql:add_note.sql:2: ERROR:  canceling statement due to lock timeout
+Retrying [3 / 500]
+…
+Retrying [9 / 500]
+SET
+<span class="o">ALTER TABLE</span></pre>
+    <p>Each attempt waited at most 50&nbsp;ms, so the checkout queries never queued for longer than that. When the report finished, the next attempt got its lock, and psql-retry exited 0. sqitch uses it through a small wrapper:</p>
+    <p class="filename">database/psql-retry.sh</p>
+<pre data-lang="shell">#!/usr/bin/env bash
+<span class="c"># sqitch calls this the way it calls psql. psql-retry reruns the script
+# while it fails with "canceling statement due to lock timeout".</span>
+declare -a processed_args=()
+for arg in "$@"; do
+  processed_args+=("$(printf "%q" "$arg")")
+done
+export PSQL_ARGS="${processed_args[*]}"
+exec psql-retry</pre>
+<pre data-lang="shell">sqitch deploy --client database/psql-retry.sh "$PRODUCTION_TARGET"</pre>
+    <p>Each retry runs the whole script again from the top, so every script must be safe to run again after it gave up part-way. The templates are written for that: a transaction around everything that can be in one, and <code>if not exists</code>, <code>if exists</code> and guards for what cannot, such as the concurrent index build, which refuses to continue if an earlier attempt left an invalid index.</p>
+    <p>Locally you can use plain <code>psql</code>. Use the wrapper whenever you want to exercise the production path.</p>
+
+    <h2 id="precommit">Before a commit</h2>
+    <p>Checks that need no database and take a second.</p>
+    <ul>
+      <li><strong>sqint's static pass</strong> on staged deploy scripts.</li>
+      <li><strong>The plan only grows.</strong> No line of <code>sqitch.plan</code> that exists on <code>master</code> is changed or removed.</li>
+      <li><strong>Snapshots are not edited.</strong> A new <code>@tag</code> file is expected; a modified or deleted one is a mistake.</li>
+      <li><strong>hasql-th-format --check</strong>, if you use hasql-th, so the SQL in quotes has one format.</li>
+    </ul>
+    <p class="filename">.pre-commit-config.yaml</p>
+<pre data-lang="yaml">repos:
+  - repo: local
+    hooks:
+      - id: sqint
+        name: sqint
+        entry: sqint
+        language: system
+        files: ^database/deploy/.*\.sql$
+
+      - id: plan-only-grows
+        name: sqitch.plan only grows
+        language: system
+        pass_filenames: false
+        files: ^database/sqitch.*\.plan$
+        entry: >-
+          sh -c '! git diff --cached -U0 master -- "database/sqitch*.plan"
+                 | grep -E "^-[^-]"'
+
+      - id: snapshots-are-not-edited
+        name: rework snapshots are not edited
+        language: system
+        pass_filenames: false
+        files: '@'
+        entry: >-
+          sh -c 'files=$(git diff --cached --name-only --diff-filter=MD -- "database/*@*.sql");
+                 [ -z "$files" ] || { echo "edited snapshots: $files"; exit 1; }'</pre>
+
+    <h2 id="ci">On a pull request</h2>
+    <p>These need a PostgreSQL. The order matters: build the schema <code>master</code> has, then apply the branch on top, the way production will.</p>
+    <ol>
+      <li><strong>Deploy <code>master</code>'s plan</strong> into a scratch database.</li>
+      <li><strong>Run sqint's dynamic pass.</strong> It deploys each new change in plan order, runs its statements in a rolled-back transaction while a second connection watches <code>pg_locks</code>, asks the planner whether a cast defeats an index, and checks every SQL function after each change. It reports the locks a change really took, which the static pass can only infer.</li>
+      <li><strong>Revert and deploy again.</strong> <code>sqitch rebase --onto</code> the base's last change runs every new revert script, then every deploy script a second time.</li>
+      <li><strong>Check the queries</strong> of the branch against the result, with hasql-check if you use hasql-th.</li>
+      <li><strong>Run your tests</strong>, pgTAP or otherwise.</li>
+    </ol>
+    <p class="filename">.github/workflows/database.yml (the database part; add your own build and tests)</p>
+<pre data-lang="yaml">name: database
+on: pull_request
+
+jobs:
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      TARGET: db:pg://postgres@localhost/postgres
+      SQITCH_TARGET: db:pg://postgres@localhost/postgres   # sqint deploys to sqitch's default target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+      - run: nix profile install nixpkgs#sqitchPg github:kronor-io/sqint
+
+      - name: Deploy the base branch
+        run: |
+          git worktree add ../base "origin/$GITHUB_BASE_REF"
+          (cd ../base &amp;&amp; sqitch deploy "$TARGET")
+          baseline=$(awk '!/^[%#@]/ &amp;&amp; NF { change = $1 } END { print change }' ../base/database/sqitch.plan)
+          echo "BASELINE=$baseline" >> "$GITHUB_ENV"
+
+      - name: Lint against the database
+        run: |
+          sqint --with-postgres "postgres://postgres:postgres@localhost/postgres" \
+                --baseline-change "$BASELINE" \
+                $(git diff --name-only --diff-filter=AM "origin/$GITHUB_BASE_REF" -- database/deploy)
+
+      - name: Revert and deploy again
+        run: |
+          sqitch deploy "$TARGET"
+          sqitch rebase -y --onto "$BASELINE" "$TARGET"</pre>
+    <div class="callout warn">
+      <p><strong>Reworks need sqint 0.1.1.0.</strong> Earlier releases find changes by name, which a rework makes ambiguous. If the branch reworks the same change <code>master</code>'s plan ends with, they check nothing, without saying so; if a change is reworked more than once after the baseline, they stop with sqitch's "is ambiguous" error. 0.1.1.0 places the baseline using the sqitch registry and deploys earlier occurrences as <code>change@tag</code>.</p>
+    </div>
+    <p>sqint deploys the changes for real, so give it a throwaway database, and point both its <code>PG*</code> variables and <code>SQITCH_TARGET</code> at the same database as <code>--with-postgres</code>: sqint runs <code>sqitch deploy</code> against sqitch's default target, and a database named in <code>sqitch.conf</code>'s target wins over <code>PGDATABASE</code>. Concurrent index builds cannot run in its rolled-back transaction; it reports them at INFO and leaves them to the static pass.</p>
+
+    <h2 id="compat">Before a deploy</h2>
+    <p>The database migrates first, then the new code rolls out, so for a while the old code runs against the new schema. Check that it can:</p>
+<pre data-lang="shell"><span class="c"># the commit running in production now</span>
+git worktree add ../running "$DEPLOYED_SHA"
+
+<span class="c"># a scratch database with the new schema</span>
+sqitch deploy "$TARGET"
+
+<span class="c"># the running code's queries, against it</span>
+(cd ../running &amp;&amp; find src -name '*.hs' -print0 | hasql-check --files0-from -)</pre>
+    <p>A statement that fails to prepare here would fail in production during the rollout. Split the change: add the new thing now, remove the old one in a later release, once no running code uses it.</p>
+    <p>hasql-check covers Haskell services that use hasql-th. Other consumers, such as a GraphQL layer or a reporting tool, need their own version of this check.</p>
+
+    <h2 id="order">The deploy</h2>
+    <ol>
+      <li>Deploy the database with psql-retry as the client, <code>--mode change</code> so a failing change is reverted on its own and the ones before it stay.</li>
+      <li>Roll out the application.</li>
+      <li>Remove what the old code needed in a later release.</li>
+    </ol>
+
+    <h2 id="drift">Drift</h2>
+    <p>Someone ran an <code>alter</code> by hand during an incident. To find out, compare production with what the deployed revision's plan builds:</p>
+<pre data-lang="shell">sqiff diff --from "rev:$DEPLOYED_SHA" --to "host=replica.internal dbname=shop"</pre>
+    <p>sqiff checks out that revision, deploys its plan into a scratch database started from your compose file and cached between runs, and compares the catalogs. Comparing with <code>master</code> instead would also report changes that are merged but not yet deployed. <code>diff</code> exits with 1 when there is a difference, so it can run on a schedule.</p>
+
+    <h2 id="limits">What the checks do not prove</h2>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Check</th><th>Tells you</th><th>Does not tell you</th></tr></thead>
+      <tbody>
+        <tr><td>sqint, static</td><td>Statements that take heavy locks, rewrite, or defeat indexes, by their shape</td><td>How big the table is, or whether a type change is free</td></tr>
+        <tr><td>sqint, dynamic</td><td>The locks a change really took, broken functions, confirmed index misses</td><td>How long anything takes on production data</td></tr>
+        <tr><td>Revert and redeploy</td><td>Reverts work, and deploys run twice cleanly</td><td>That a script resumes correctly after giving up half-way</td></tr>
+        <tr><td>hasql-check</td><td>Every hasql-th statement prepares against the schema</td><td>Anything about code that does not use hasql-th</td></tr>
+        <tr><td>sqiff hazards</td><td>What each step costs in locks, rewrites and lost data</td><td>Whether that cost is acceptable. That is your call</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="next">
+      <a href="git.html">Git and review</a>
+      <a href="architecture.html">Next: database design</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>

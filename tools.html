@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tools · sqitchcraft</title>
+<meta name="description" content="Reference for create-migration, sqiff, sqint, psql-retry, statecharts, hasql-check and sqitch-plan: what each does, how to install it, and its main commands.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html" aria-current="page">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="Tools">
+    <p>Tools</p>
+    <ul>
+      <li><a href="#create-migration">create-migration</a></li>
+      <li><a href="#sqiff">sqiff</a></li>
+      <li><a href="#sqint">sqint</a></li>
+      <li><a href="#psql-retry">psql-retry</a></li>
+      <li><a href="#statecharts">statecharts</a></li>
+      <li><a href="#hasql-check">hasql-check</a></li>
+      <li><a href="#sqitch-plan">sqitch-plan</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>The tools</h1>
+    <p class="lede">What each one does, how to install it, and the commands you will use most. Each repository's README has the full reference.</p>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>If you want to…</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td>Change a table by editing its file</td><td><a href="#sqiff">sqiff</a></td></tr>
+        <tr><td>Start a new object, or a change that takes several releases</td><td><a href="#create-migration">create-migration</a>, from the sqitch-with-templates repository</td></tr>
+        <tr><td>Catch lock and rewrite hazards before review</td><td><a href="#sqint">sqint</a></td></tr>
+        <tr><td>Deploy to a busy database without queueing traffic</td><td><a href="#psql-retry">psql-retry</a></td></tr>
+        <tr><td>Check a Haskell service's queries against the schema</td><td><a href="#hasql-check">hasql-check</a></td></tr>
+        <tr><td>Enforce a lifecycle in the database</td><td><a href="#statecharts">statecharts</a>, installed as the <code>pg_statecharts</code> extension</td></tr>
+        <tr><td>Build your own tooling on <code>sqitch.plan</code></td><td><a href="#sqitch-plan">sqitch-plan</a>, a Haskell library</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <!-- create-migration -->
+    <div class="tool-head" id="create-migration">
+      <h2>create-migration</h2>
+      <a href="https://github.com/kronor-io/sqitch-with-templates">kronor-io/sqitch-with-templates</a>
+    </div>
+    <p>Adds sqitch changes from templates that hold what we learned migrating a busy production database.</p>
+    <p>It runs <code>sqitch add</code> with one of 20 templates and names the change after what it creates. The migration templates stop waiting for a lock after 50&nbsp;ms, the index templates build concurrently, constraints are added <code>not valid</code> and validated separately, and scripts that cannot run in a transaction are written to be run again. Missing values are asked for, with completion from your <code>deploy/</code> folders.</p>
+<pre data-lang="shell">nix run github:kronor-io/sqitch-with-templates -- --help
+nix profile install github:kronor-io/sqitch-with-templates</pre>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Command</th><th>Writes</th></tr></thead>
+      <tbody>
+        <tr><td><code>table</code>, <code>view</code>, <code>domain</code></td><td>A new object in its own file</td></tr>
+        <tr><td><code>function general</code>, <code>function statechart</code></td><td>A function, or a statechart callback taking <code>fsm_event_payload</code></td></tr>
+        <tr><td><code>trigger row</code>, <code>trigger statement</code></td><td>A trigger and its function, under <code>trigger/&lt;table&gt;/</code></td></tr>
+        <tr><td><code>migration</code></td><td>A dated, hand-written change with lock timeouts in place</td></tr>
+        <tr><td><code>add-column</code>, <code>add-index</code>, <code>validate-constraint</code></td><td>One safe step each</td></tr>
+        <tr><td><code>non-nullable-column</code></td><td>Five changes: add, check <code>not valid</code>, backfill, validate, <code>set not null</code></td></tr>
+        <tr><td><code>bulk-update</code></td><td>A batched update that commits between batches</td></tr>
+        <tr><td><code>rename-column-step-1</code>, <code>-step-2</code></td><td>A rename that old and new code survive</td></tr>
+        <tr><td><code>add-index-partitioned</code>, <code>add-fk-partitioned</code></td><td>Per-partition builds for pg_partman tables</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Use <code>--db TARGET</code> for another target in <code>sqitch.conf</code>, and <code>--template-directory</code> for your own templates. The flake also builds <code>sqitchPg</code>, a sqitch with the templates installed, so plain <code>sqitch add --template add_column</code> works.</p>
+
+    <!-- sqiff -->
+    <div class="tool-head" id="sqiff">
+      <h2>sqiff</h2>
+      <a href="https://github.com/kronor-io/sqiff">kronor-io/sqiff</a>
+    </div>
+    <p>Compares PostgreSQL schemas and writes the difference as sqitch changes.</p>
+    <p>Edit a table's <code>create table</code> file and sqiff writes the migration that gets an existing database there: dependent views, functions, constraints and policies dropped and recreated around it with their comments and grants, a revert for every step, and the hazards of each one. It reads both schemas from PostgreSQL's catalogs rather than parsing SQL.</p>
+<pre data-lang="shell">nix run github:kronor-io/sqiff -- --help
+docker run --rm -v "$PWD:/work" ghcr.io/kronor-io/sqiff --help
+curl -fsSL "https://github.com/kronor-io/sqiff/releases/latest/download/sqiff-$(uname -m)-linux.tar.xz" | tar -xJ -C ~/.local</pre>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Command</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>sqiff table FILE [--write]</code></td><td>The migration for an edited table file, compared with <code>master</code>. <code>--write</code> adds it and reworks the table.</td></tr>
+        <tr><td><code>sqiff diff --from master|rev:REV|CONN [--to CONN]</code></td><td>What differs and what depends on it. Exits 1 on a difference.</td></tr>
+        <tr><td><code>sqiff plan --from … [--to …]</code></td><td>The ordered SQL, each step with its hazards.</td></tr>
+        <tr><td><code>sqiff sqitch --from … [--dry-run]</code></td><td>Writes that plan as sqitch changes.</td></tr>
+        <tr><td><code>sqiff describe [--out DIR]</code></td><td>The schema as one file per object, to commit and review.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Configure it in <code>sqiff.yaml</code> next to <code>sqitch.conf</code>: schemas to leave out, change-name patterns, create-migration's templates, and how to start the scratch database for <code>--from master</code>. It asks rather than guesses when a dropped and an added column might be a rename.</p>
+
+    <!-- sqint -->
+    <div class="tool-head" id="sqint">
+      <h2>sqint</h2>
+      <a href="https://github.com/kronor-io/sqint">kronor-io/sqint</a>
+    </div>
+    <p>Lints sqitch migrations for PostgreSQL lock and rewrite hazards.</p>
+    <p>The static pass parses deploy scripts, PL/pgSQL bodies included, with PostgreSQL's own parser. The dynamic pass deploys each change into a scratch database and reports the locks it actually took, the casts the planner confirms defeat an index, and the functions a change left broken.</p>
+<pre data-lang="shell">nix run github:kronor-io/sqint -- --help
+sqint $(git diff --name-only main -- database/deploy)</pre>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Rule</th><th>Severity</th><th>Reports</th></tr></thead>
+      <tbody>
+        <tr><td><code>lock/add-column</code></td><td><span class="sev block">BLOCK</span></td><td>A <code>not null</code> column without a default</td></tr>
+        <tr><td><code>lock/add-constraint</code></td><td><span class="sev block">BLOCK</span></td><td>A check or foreign key without <code>not valid</code></td></tr>
+        <tr><td><code>lock/alter-column-type</code></td><td><span class="sev block">BLOCK</span></td><td>A type change that rewrites the table</td></tr>
+        <tr><td><code>lock/create-index</code></td><td><span class="sev warn">WARN</span></td><td>An index built without <code>concurrently</code></td></tr>
+        <tr><td><code>index/cast-on-column</code></td><td><span class="sev warn">WARN</span></td><td>A cast on a column in a predicate</td></tr>
+        <tr><td><code>index/defeated</code></td><td><span class="sev block">BLOCK</span></td><td>The planner confirms a sequential scan</td></tr>
+        <tr><td><code>txn/set-local-across-commit</code></td><td><span class="sev block">BLOCK</span></td><td><code>set local</code> in a block that commits</td></tr>
+        <tr><td><code>function/broken-body</code></td><td><span class="sev block">BLOCK</span></td><td>A SQL function left failing after a change</td></tr>
+        <tr><td><code>lock/observed-*</code></td><td><span class="sev info">varies</span></td><td>A lock the dynamic pass saw taken</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>BLOCK exits 1. There is no configuration file: silence one statement with <code>-- lint:ignore reason="…"</code>, and the reason is required.</p>
+
+    <!-- psql-retry -->
+    <div class="tool-head" id="psql-retry">
+      <h2>psql-retry</h2>
+      <a href="https://github.com/kronor-io/psql-retry">kronor-io/psql-retry</a>
+    </div>
+    <p>Runs psql again when a script fails with a lock timeout.</p>
+    <p>Retrying from outside the database avoids the subtransactions a retry loop inside PL/pgSQL would open. It reruns on <code>canceling statement due to lock timeout</code> only, with jittered backoff from 10&nbsp;ms capped at 60&nbsp;s, up to 500 times. Any other error stops it.</p>
+<pre data-lang="shell">nix run github:kronor-io/psql-retry -- --help
+PSQL_ARGS="'postgres://…' -v ON_ERROR_STOP=1 -f script.sql" psql-retry
+sqitch deploy --client database/psql-retry.sh</pre>
+    <p>Called directly, pass <code>ON_ERROR_STOP=1</code>, or psql exits 0 after an error and nothing is retried. sqitch sets it for you. The wrapper script that turns sqitch's arguments into <code>PSQL_ARGS</code> is on <a href="pipeline.html#retry">CI and deploys</a>.</p>
+
+    <!-- statecharts -->
+    <div class="tool-head" id="statecharts">
+      <h2>statecharts</h2>
+      <a href="https://github.com/kronor-io/statecharts">kronor-io/statecharts</a>
+    </div>
+    <p>A statechart interpreter built entirely inside PostgreSQL.</p>
+    <p>Charts are rows: states, nested states, parallel regions, final states and transitions, following SCXML. Sending an event runs the transition and its <code>on_entry</code> and <code>on_exit</code> callbacks in the statement that sent it, so the state commits with your data. Every state a machine enters is logged.</p>
+<pre data-lang="sql">create extension pg_statecharts cascade;     <span class="c">-- pure SQL; needs ltree. PostgreSQL 16 to 18</span>
+
+select fsm.start_machine_with_latest_statechart(statechart_name => 'invoice_flow');
+select fsm.notify_state_machine(machine_id => 42, event_name => 'invoice.pay',
+                                data => '{"amount": "120.00"}');
+select fsm.is_state_active(machine_id => 42, state_id => 'paid');</pre>
+    <p>Install it with PGXN (<code>pgxn install pg_statecharts</code>), a Debian package, or <code>make install</code>. On development machines, <code>pg_statecharts_dev</code> turns <code>.scxml</code> files into sqitch changes with <code>fsm.gen_statechart_sqitch_migrations</code>; never create it in production. A Haskell SDK generates state and event types from a chart. Projects that deployed the engine as a sqitch project can move to the extension with <code>create extension pg_statecharts version 'sqitch'</code>.</p>
+
+    <!-- hasql-check -->
+    <div class="tool-head" id="hasql-check">
+      <h2>hasql-check</h2>
+      <a href="https://github.com/kronor-io/hasql-check">kronor-io/hasql-check</a>
+    </div>
+    <p>Checks the SQL in your hasql-th quotes against a live PostgreSQL schema.</p>
+    <p>hasql-th checks that a statement parses. hasql-check <code>PREPARE</code>s it, so a dropped column or a changed function signature fails in CI or in your editor instead of in production. Optional checks catch nullable columns decoded as non-null and casts that lose data.</p>
+<pre data-lang="shell">git clone https://github.com/kronor-io/hasql-check
+cd hasql-check &amp;&amp; cabal install exe:hasql-check
+
+hasql-check --nullability --types src/Billing/*.hs</pre>
+    <ul>
+      <li><strong>At compile time:</strong> import <code>Hasql.Check.TH</code> instead of <code>Hasql.TH</code> and set <code>HASQL_CHECK_DATABASE_URL</code>.</li>
+      <li><strong>Adopting gradually:</strong> <code>--write-baseline</code> records today's warnings; <code>--baseline</code> ignores them.</li>
+      <li><strong>Allowing one case:</strong> <code>-- hasql-check: allow nullable(nickname)</code> above the quote.</li>
+      <li><strong>Also in the repository:</strong> <code>hasql-th-format</code> formats the SQL in quotes, and <code>hasql-th-audit</code> compares quotes between two versions of a file.</li>
+    </ul>
+
+    <!-- sqitch-plan -->
+    <div class="tool-head" id="sqitch-plan">
+      <h2>sqitch-plan</h2>
+      <a href="https://github.com/kronor-io/sqitch-plan">kronor-io/sqitch-plan</a>
+    </div>
+    <p>A Haskell library to parse, query and render <code>sqitch.plan</code> files.</p>
+    <p>It covers the whole format, keeps line numbers, and renders a parsed plan back byte for byte. Queries answer the questions plan tooling asks: which changes come after a line, whether a change is reworked and at which tag. sqint uses it to find the changes after its baseline.</p>
+<pre data-lang="hs">src  &lt;- Text.IO.readFile "database/sqitch.plan"
+plan &lt;- either (fail . Text.unpack . Plan.renderParseError) pure (Plan.parsePlan src)
+mapM_ (\c -> print (c.line, c.value.name, Plan.reworkTag c.value)) (Plan.changes plan)</pre>
+    <p>Pin it from a <code>cabal.project</code> with a <code>source-repository-package</code> pointing at the repository.</p>
+
+    <div class="next">
+      <a href="agents.html">Instructions for agents</a>
+      <a href="index.html">Back to the overview</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>

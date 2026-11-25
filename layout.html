@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The layout · sqitchcraft</title>
+<meta name="description" content="Give every database object a home: one file per table, view and function, dated migrations beside them, and reworks that let a file change without rewriting history.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html" aria-current="page">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>
+      <li><a href="#question">The question it answers</a></li>
+      <li><a href="#tree">The whole tree</a></li>
+      <li><a href="#two-kinds">Definitions and migrations</a></li>
+      <li><a href="#reworks">How a file changes</a></li>
+      <li><a href="#upgrade">Fresh and existing databases</a></li>
+      <li><a href="#names">Names</a></li>
+      <li><a href="#config">Configuration</a></li>
+      <li><a href="#costs">What it costs</a></li>
+      <li><a href="#adopt">Adopting it</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>Give every object a home</h1>
+    <p class="lede">A database schema is code that many people read and few people write. Lay it out for the readers: one file per object, at a path you can guess, saying what that object is today.</p>
+    <p class="outcome">Every tree, file and plan line on this page comes from the example project the site follows: a <code>shop</code> database with an invoice table, changed three times by two developers.</p>
+
+    <h2 id="question">The question it answers</h2>
+    <p>Where do you look to understand <code>billing.invoice</code>?</p>
+    <ul class="verdicts">
+      <li class="no">Its first migration tells you how it began, months ago.</li>
+      <li class="no">Each later migration tells you one thing that happened to it, if you can find them.</li>
+      <li class="yes"><code>database/deploy/billing/table/invoice.sql</code> tells you what the team means it to be now, columns, comments and indexes together, in a form you can read top to bottom.</li>
+    </ul>
+    <p>That is the whole idea. Everything else on this page exists to keep that file honest while existing databases still get upgraded step by step.</p>
+
+    <h2 id="tree">The whole tree</h2>
+    <p>sqitch keeps three parallel trees: <code>deploy/</code> makes a change, <code>revert/</code> undoes it, <code>verify/</code> checks it worked. Under each, the path of a file is the name of its change.</p>
+<pre data-lang="tree">sqitch.conf                       <span class="c"># at the repository root; top_dir = database</span>
+sqiff.yaml                        <span class="c"># sqiff's settings (optional)</span>
+database/
+  sqitch.plan                     <span class="c"># the order things are deployed in</span>
+  templates/                      <span class="c"># create-migration's templates, if you vendor them</span>
+  deploy/
+    base_schemas.sql              <span class="c"># create schema …; comment on schema …</span>
+    billing/
+      table/
+<span class="hl">        invoice.sql               <span class="c"># the table as it is today: edit this</span></span>
+        invoice@2026-11-25_sqiff.sql      <span class="c"># snapshots of earlier versions,</span>
+        invoice@2026-11-25_sqiff_2.sql    <span class="c"># kept so old changes can still</span>
+        invoice@2026-11-25_paid_at.sql    <span class="c"># deploy and revert: never edit</span>
+        invoice/
+          index/invoice_customer_email.sql
+      view/
+        daily_invoiced.sql
+    migrations/
+      2026/11/
+        2026-11-25-100552-add-column-billing.invoice.due_on.sql
+        2026-11-25-100616-alter-billing.invoice.amount.sql
+        2026-11-25-100617-comment-billing.invoice.amount.sql
+        2026-11-25-100724-add-column-billing.invoice.paid_at.sql
+  revert/                         <span class="c"># the same tree</span>
+  verify/                         <span class="c"># the same tree</span></pre>
+    <p>In a larger project the same shape repeats per schema: <code>deploy/&lt;schema&gt;/{table,view,function,type,trigger/&lt;table&gt;}/&lt;name&gt;.sql</code>. Kronor's production database has around twenty schemas and thousands of deploy files in this layout, and finding any one of them is still a matter of knowing its name.</p>
+
+    <h2 id="two-kinds">Definitions and migrations</h2>
+    <p>There are two kinds of deploy script, and keeping them apart is what the rest depends on.</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">A definition</p>
+        <p class="pane-sub">deploy/billing/table/invoice.sql: what the object is</p>
+<pre data-lang="sql">BEGIN;
+
+    create table if not exists billing.invoice (
+        id bigint generated always as identity primary key,
+        customer_email text not null,
+        amount numeric(12,2) not null,
+        issued_on date not null,
+        due_on date,
+        paid_at timestamptz,
+        created_at timestamptz not null default clock_timestamp()
+    );
+
+    comment on column billing.invoice.amount is
+      'What the customer owes, to the cent.';
+
+    create index if not exists invoice_customer_email
+        on billing.invoice (customer_email);
+
+COMMIT;</pre>
+        <p class="pane-note">Written as if creating the table today. Its <code>if not exists</code> guards make it safe to run where the table already exists.</p>
+      </div>
+      <div class="pane">
+        <p class="pane-label">A migration</p>
+        <p class="pane-sub">deploy/migrations/2026/11/…-add-column-billing.invoice.due_on.sql: how a database got there</p>
+<pre data-lang="sql">set lock_timeout to '50ms';
+set statement_timeout to '50ms';
+
+begin;
+
+alter table billing.invoice
+    add column if not exists due_on date;
+
+commit;</pre>
+        <p class="pane-note">Runs once on each database, in plan order. Dated, so the folder reads as a log. sqiff and create-migration write these; you rarely start one from nothing.</p>
+      </div>
+    </div>
+    <div class="callout rule">
+      <p>Never put <code>alter table</code> in a definition file. <code>if not exists</code> only checks that the table exists; it does not add the columns you added to the file. The change to an existing table always comes from a migration.</p>
+    </div>
+
+    <h2 id="reworks">How a file changes without rewriting history</h2>
+    <p>Once a change has been deployed anywhere, its scripts are history: sqitch will never run them again on that database, and a fresh database still needs them as they were. So how can <code>invoice.sql</code> change at all?</p>
+    <p>sqitch's answer is a <strong>rework</strong>. It copies the current scripts to <code>invoice@&lt;tag&gt;.sql</code>, where the tag marks the point in the plan they belong to, and lets you edit the original. From then on, the plan deploys the snapshot where the old change was and the edited file where the new one is.</p>
+    <p>Doing this by hand is fiddly: a tag, a rework, a migration that comes before it, and reverts for both. <code>sqiff table --write</code> does all of it from your edit. Here is the plan after the third change to the invoice table, planners and timestamps left out:</p>
+<pre data-lang="plan">base_schemas
+billing/table/invoice                                     <span class="c"># deployed from invoice@2026-11-25_sqiff.sql</span>
+billing/view/daily_invoiced
+migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on
+@2026-11-25_sqiff
+billing/table/invoice [billing/table/invoice@2026-11-25_sqiff]
+migrations/2026/11/2026-11-25-100616-alter-billing.invoice.amount
+billing/table/invoice/index/invoice_customer_email
+migrations/2026/11/2026-11-25-100617-comment-billing.invoice.amount
+@2026-11-25_sqiff_2
+billing/table/invoice [billing/table/invoice@2026-11-25_sqiff_2]
+migrations/2026/11/2026-11-25-100724-add-column-billing.invoice.paid_at
+@2026-11-25_paid_at
+<span class="hl">billing/table/invoice [billing/table/invoice@2026-11-25_paid_at]  <span class="c"># deployed from invoice.sql</span></span></pre>
+    <ul>
+      <li>Each migration comes before the rework it belongs to, so the <code>alter</code> runs before the definition that already includes it.</li>
+      <li>The revert of a reworked definition is the previous definition, not a <code>drop table</code>: undoing the latest change must not delete the table.</li>
+      <li>Snapshots are written by sqitch and sqiff. Never create or edit an <code>@tag</code> file by hand.</li>
+    </ul>
+
+    <h2 id="upgrade">Fresh and existing databases take the same road</h2>
+    <p>There is no separate "build from scratch" script that could drift from the migrations. Every database walks the same plan; it just starts at a different place.</p>
+    <div class="lanes" role="list">
+      <div class="lane" role="listitem">
+        <span>A fresh database</span>
+        <ol>
+          <li>invoice, as first written</li>
+          <li>add due_on</li>
+          <li class="noop">invoice: no-op</li>
+          <li>alter amount</li>
+          <li>index</li>
+          <li class="noop">invoice: no-op</li>
+          <li>add paid_at</li>
+          <li class="noop">invoice: no-op</li>
+        </ol>
+      </div>
+      <div class="lane" role="listitem">
+        <span>Production, before the amount change</span>
+        <ol>
+          <li class="done">invoice, as first written</li>
+          <li class="done">add due_on</li>
+          <li class="done">invoice</li>
+          <li>alter amount</li>
+          <li>index</li>
+          <li class="noop">invoice: no-op</li>
+          <li>add paid_at</li>
+          <li class="noop">invoice: no-op</li>
+        </ol>
+      </div>
+    </div>
+    <p>Dashed steps run, and find the table already in the shape they describe. Struck-out steps were deployed earlier. We checked both roads on the example project: a fresh <code>sqitch deploy</code>, an upgrade of a database at the earlier commit, and <code>sqitch rebase --onto @2026-11-25_sqiff</code>, which reverts to that tag and deploys again.</p>
+
+    <h2 id="names">Names</h2>
+    <p>The change name is the file's path without <code>.sql</code>. sqiff and create-migration use the same patterns, so the plan reads the same whichever wrote it.</p>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Object</th><th>Change name</th></tr></thead>
+      <tbody>
+        <tr><td>Table</td><td><code>{schema}/table/{name}</code></td></tr>
+        <tr><td>View</td><td><code>{schema}/view/{name}</code></td></tr>
+        <tr><td>Function</td><td><code>{schema}/function/{name}</code></td></tr>
+        <tr><td>Trigger</td><td><code>{schema}/trigger/{table}/{name}</code></td></tr>
+        <tr><td>Index built on its own</td><td><code>{schema}/table/{table}/index/{name}</code></td></tr>
+        <tr><td>Domain</td><td><code>type/{name}</code></td></tr>
+        <tr><td>Migration</td><td><code>migrations/YYYY/MM/YYYY-MM-DD-HHMMSS-{what}</code></td></tr>
+        <tr><td>Statechart</td><td><code>statechart/{name}-{version}</code></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Migration timestamps are UTC to the second, which makes accidental clashes between branches rare. The note on each plan line starts with the template that wrote it (<code>add_column: add column billing.invoice.due_on</code>), so the plan also reads as a log of intent.</p>
+
+    <h2 id="config">Configuration</h2>
+    <p>Keep <code>sqitch.conf</code> at the repository root and run every command from there: sqitch, create-migration and sqiff all read it from the current directory. This is the example project's, as <code>sqitch init</code> wrote it plus a <code>[deploy]</code> section:</p>
+    <p class="filename">sqitch.conf</p>
+<pre data-lang="ini">[core]
+	engine = pg
+	top_dir = database
+[engine "pg"]
+	target = db:pg:shop
+[deploy]
+	verify = true
+	mode = change        <span class="c"># on failure, revert only the change that failed</span></pre>
+    <p class="filename">sqiff.yaml</p>
+<pre data-lang="yaml">templates: database/templates    <span class="c"># write migrations with create-migration's templates</span></pre>
+    <p>With the templates set, sqiff's migrations start with the same 50&nbsp;ms lock timeout as hand-written ones. sqint's default <code>--database-root</code> is <code>database</code>, so it needs no flags here. hasql-check and psql-retry do not read the project at all: they take a database URL and psql's arguments.</p>
+
+    <h2 id="costs">What it costs</h2>
+    <ul class="verdicts">
+      <li class="cost"><strong>More files.</strong> Every rework adds three snapshots. After three changes the invoice table has twelve files across the three trees. They are never edited, and code review can collapse them (<a href="git.html#review">see how</a>).</li>
+      <li class="cost"><strong>Reworks to learn.</strong> The rules above are few, but each one matters. <code>sqiff table</code> follows them for tables. For a view or a function, run <code>sqitch rework</code> and edit the file; <a href="functions.html">functions and views</a> walks through it.</li>
+      <li class="cost"><strong>A shared plan.</strong> Every branch appends to <code>sqitch.plan</code>, so two branches that both change the schema will conflict there. <a href="git.html#conflicts">Resolving it is mechanical</a>, but it has to be done right.</li>
+    </ul>
+
+    <h2 id="adopt">Adopting it</h2>
+    <p><strong>A new project:</strong> <code>sqitch init</code> with <code>--top-dir database</code>, a <code>base_schemas</code> change, then <code>create-migration table</code> for each table.</p>
+    <p><strong>An existing sqitch project:</strong> you do not have to move history. Pick the next table you are about to change, and add a definition change for it: <code>create table if not exists</code> with the table as it is now, comments and indexes included. On existing databases it does nothing; on fresh ones the earlier migrations have already created the table, so it does nothing there either. To check the file matches the live table, <code>sqiff table FILE --against-database</code> compares the two and prints any difference. From then on, edit that file.</p>
+    <p><strong>Not ready for either:</strong> sqint and psql-retry work on any sqitch project, whatever its layout.</p>
+
+    <div class="next">
+      <a href="index.html">Overview</a>
+      <a href="workflow.html">Next: one change, end to end</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>

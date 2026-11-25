@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>For agents · sqitchcraft</title>
+<meta name="description" content="The AGENTS.md we recommend so a coding agent can make PostgreSQL schema changes with sqitch, sqiff, sqint and create-migration on its own, and a script that checks its work.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html" aria-current="page">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>
+      <li><a href="#why">Why agents need it written down</a></li>
+      <li><a href="#install">Install it</a></li>
+      <li><a href="#contents">What the file says</a></li>
+      <li><a href="#check">The check script</a></li>
+      <li><a href="#guardrails">Guardrails outside the file</a></li>
+      <li><a href="#tested">We tried it</a></li>
+      <li><a href="#file">The file</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>Instructions for agents</h1>
+    <p class="lede">Everything on this site is a set of habits a careful engineer picks up over time. A coding agent has none of them, but it follows written rules well. This page is the <code>AGENTS.md</code> we recommend, so an agent can make schema changes on its own and tell you clearly what it did and what it left for you to decide.</p>
+    <p class="outcome">Two files: <a href="agents/AGENTS.md" download>AGENTS.md</a>, the instructions, and <a href="agents/check-database" download>check-database</a>, a script the instructions tell the agent to run before it finishes.</p>
+
+    <h2 id="why">Why agents need it written down</h2>
+    <p>Asked to "add a currency to invoices", an agent with no instructions does what most of the internet does: writes <code>0042_add_currency.sql</code> with an <code>alter table</code>, maybe edits the table's file too, and calls it done. Every habit on this site is invisible from the code alone:</p>
+    <ul class="verdicts">
+      <li class="no">that the table's file must never contain an <code>alter</code>, and is changed by a rework;</li>
+      <li class="no">that <code>@tag</code> files look like ordinary SQL and must never be touched;</li>
+      <li class="no">that adding an argument with <code>create or replace function</code> makes a second function and breaks every caller;</li>
+      <li class="no">that a <code>sqitch.plan</code> conflict is resolved by regenerating, not by keeping both sides;</li>
+      <li class="no">that some decisions, like a table rewrite or dropping a column, are not the agent's to make.</li>
+    </ul>
+    <p>The file writes those down, in the order an agent needs them: where things are, which workflow fits the task, the rules, how to check, when to stop, and what to report.</p>
+
+    <h2 id="install">Install it</h2>
+    <ol>
+      <li><strong>Add the instructions.</strong> Save <a href="agents/AGENTS.md" download>AGENTS.md</a> at the root of your repository. Codex and most other agents read <code>AGENTS.md</code> on their own. If you already have one, paste it in as a section. For Claude Code, add a line to <code>CLAUDE.md</code> that imports it:
+<pre data-lang="plain">@AGENTS.md</pre></li>
+      <li><strong>Add the check.</strong> Save <a href="agents/check-database" download>check-database</a> as <code>scripts/check-database</code> and make it executable. Run it yourself once to see it pass.</li>
+      <li><strong>Fill in the details.</strong> Replace the guide URL placeholder, and change <code>master</code> if your main branch has another name. If your services are not written in Haskell, delete the hasql-check line.</li>
+      <li><strong>Give the agent the tools.</strong> sqitch, sqiff, sqint, create-migration, psql and a PostgreSQL it may create scratch databases on, with <code>PG*</code> variables pointing at it. With Nix:
+<pre data-lang="shell">nix shell nixpkgs#sqitchPg nixpkgs#postgresql_18 \
+  github:kronor-io/sqiff github:kronor-io/sqint github:kronor-io/sqitch-with-templates</pre></li>
+    </ol>
+
+    <h2 id="contents">What the file says</h2>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Section</th><th>What it gives the agent</th></tr></thead>
+      <tbody>
+        <tr><td>Where things are</td><td>The layout, and the instruction to read an object's definition instead of reconstructing it from migrations.</td></tr>
+        <tr><td>Choose the workflow</td><td>A table from task to command: create an object, change a table, change a function or view, the multi-release recipes. Commands are given with every flag, because create-migration prompts when one is missing and sqitch opens an editor without <code>-n</code>.</td></tr>
+        <tr><td>Rules</td><td>The nevers and alwayses from <a href="layout.html">the layout</a>, <a href="functions.html">functions</a> and <a href="pipeline.html">shipping safely</a>, stated without exceptions.</td></tr>
+        <tr><td>Merging and rebasing</td><td>The regenerate-don't-merge procedure from <a href="git.html#conflicts">git and review</a>, and why a stale snapshot matters.</td></tr>
+        <tr><td>Check before you finish</td><td>One command, and what to do with sqint's findings: fix BLOCKs, never write a <code>lint:ignore</code> itself.</td></tr>
+        <tr><td>Stop and ask</td><td>The judgement calls: rewrites, data loss, renames, backfills of unknown size, conflicts in lines already on the main branch.</td></tr>
+        <tr><td>Report</td><td>What changed, every hazard and what was done about it, which release each part belongs to, and every check with its result.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Two choices are deliberate. The agent may not suppress a lint finding: a <code>lint:ignore</code> records a human's decision, and an agent writing one defeats the point. And it reports the hazards it accepted instead of silently accepting them, so the reviewer reads them first.</p>
+
+    <h2 id="check">The check script</h2>
+    <p>An agent is only as careful as the check it runs at the end. <code>scripts/check-database</code> puts the important checks behind one command, so the instructions can say "run this" rather than describe a procedure:</p>
+<pre data-lang="shell"><span class="p">$ </span>scripts/check-database
+== sqint: deploy scripts changed since master
+== the plan only grows
+== snapshots are not edited
+== fresh database: deploy the whole plan
+Deploying changes to db:pg:check_database_scratch
+  + base_schemas ................................................. ok
+  …
+  + migrations/2026/11/2026-11-25-105014-add-column-billing.invoice.note .. ok
+== revert this branch's 2 changes and deploy them again
+  - migrations/2026/11/2026-11-25-105014-add-column-billing.invoice.note .. ok
+  + migrations/2026/11/2026-11-25-105014-add-column-billing.invoice.note .. ok
+== database checks passed</pre>
+    <p>It reverts the branch's changes by counting them back from the end of the plan (<code>sqitch rebase --onto @HEAD^2</code>), not by name, because a reworked change's name is ambiguous. It deliberately does not use sqint's dynamic pass, which has <a href="pipeline.html#ci">known limits with reworks</a>. Run it in CI too, so the agent's check and the merge check are the same.</p>
+
+    <h2 id="guardrails">Guardrails outside the file</h2>
+    <p>Instructions are followed most of the time. For the things that must never happen, do not rely on them alone.</p>
+    <ul>
+      <li><strong>No production credentials.</strong> The agent's environment should reach a local or scratch PostgreSQL and nothing else. Keep production targets out of <code>sqitch.conf</code>; let your deploy pipeline hold them.</li>
+      <li><strong>The pre-commit hooks</strong> from <a href="pipeline.html#precommit">shipping safely</a> catch edited snapshots and rewritten plan lines whoever makes them.</li>
+      <li><strong>Review stays human.</strong> The agent's report is written for the reviewer: hazards first, then the checks. A pull request that changes the schema still needs a person to accept its costs.</li>
+    </ul>
+
+    <h2 id="tested">We tried it</h2>
+    <p>We gave Codex the example project from this site with the file at its root, and one task, phrased the way a product owner would:</p>
+    <div class="story">
+      <p>"Invoices can now be in different currencies. Add a currency to <code>billing.invoice</code>: a three-letter ISO code, required. Every existing invoice is in SEK. Then <code>billing.outstanding_for</code> should report what a customer owes in one currency, SEK unless the caller says otherwise. Make the database change on a new branch and commit it."</p>
+    </div>
+    <p>It is a hard task on purpose: a required column on a table with rows, and a new argument on a function that already has two. Codex was not told about any of the tools. What it did:</p>
+    <ul class="verdicts">
+      <li class="yes">Read the definitions, not the migrations, and chose <code>create-migration non-nullable-column</code> for the column.</li>
+      <li class="yes">Set the default to <code>'SEK'</code> in the first step, so new inserts set the column before the <code>not valid</code> check starts rejecting them.</li>
+      <li class="yes">Added the format check <code>not valid</code> and validated it in its own change.</li>
+      <li class="yes">Reworked the table and the function after the migrations, with one shared tag.</li>
+      <li class="yes">Dropped the old <code>(text, date)</code> signature in the definition, gave the new argument a default, and added a drop of the new signature to the revert script.</li>
+      <li class="yes">Ran <code>scripts/check-database</code>, left sqint's warning for a human instead of suppressing it, and ended with the report in the four parts the file asks for.</li>
+    </ul>
+    <p>We checked the result independently: the check passes, including reverting and redeploying all nine of its changes; the two existing invoices are SEK; and the function returns 120.50 in SEK and 0 in EUR for the same customer.</p>
+    <p>The trial also taught us three things, and the file now says them:</p>
+    <ul class="verdicts">
+      <li class="cost"><strong>sqiff and the batched recipes.</strong> After the recipe, Codex ran <code>sqiff table</code>, which replays the branch's earlier changes in one transaction and stopped at the backfill's <code>COMMIT</code> with <code>invalid transaction termination</code>. Codex fell back to <code>sqitch rework</code> on its own, which was right. We fixed sqiff so its replay leaves the backfill's commits out (0.1.3.0), and the file says to use <code>sqitch rework</code> with older versions.</li>
+      <li class="cost"><strong>A parameter named like a column.</strong> It named the new argument <code>currency</code>, like the column, and had to refer to it as <code>$3</code>. In a SQL function the column wins, so the file now says to qualify or rename.</li>
+      <li class="cost"><strong>Backfills.</strong> The first version told agents to stop and ask before backfilling a table they could not size. Codex went ahead, and on reflection that is the right default for a batched backfill. The file now asks for every backfill to be listed in the report instead, with whether the table's size is known.</li>
+    </ul>
+
+    <h2 id="file">The file</h2>
+    <p class="filename">AGENTS.md (<a href="agents/AGENTS.md" download>download</a>)</p>
+<pre id="agents-md" data-lang="md">Loading <a href="agents/AGENTS.md">agents/AGENTS.md</a>…</pre>
+
+    <div class="next">
+      <a href="architecture.html">Database design</a>
+      <a href="tools.html">Next: the tools</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js"></script>
+<script>
+  // Show the instructions from the file itself, so the page never drifts from it.
+  fetch("agents/AGENTS.md")
+    .then((r) => (r.ok ? r.text() : Promise.reject(r.status)))
+    .then((text) => {
+      const pre = document.getElementById("agents-md");
+      pre.textContent = text;
+      if (window.highlightPre) window.highlightPre(pre);
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>

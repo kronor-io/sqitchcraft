@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Check this branch's database changes the way CI and production will see them.
+#
+#   scripts/check-database [BASE]      BASE defaults to master
+#
+# 1. sqint's static pass on every deploy script the branch adds or changes.
+# 2. sqitch.plan only grows, and no rework snapshot is edited.
+# 3. The whole plan deployed into a fresh scratch database.
+# 4. The branch's own changes reverted and deployed again.
+#
+# Needs sqitch, sqint, psql and createdb on PATH, and PG* variables (or
+# defaults) that reach a server where it may create a scratch database.
+set -euo pipefail
+
+base=${1:-master}
+scratch=${CHECK_DATABASE_NAME:-check_database_scratch}
+target="db:pg:$scratch"
+
+echo "== sqint: deploy scripts changed since $base"
+changed=$(git diff --name-only --diff-filter=AM "$base" -- database/deploy)
+if [ -n "$changed" ]; then
+  # shellcheck disable=SC2086
+  sqint $changed
+else
+  echo "no deploy scripts changed"
+fi
+
+echo "== the plan only grows"
+if git diff -U0 "$base" -- 'database/sqitch*.plan' | grep -E '^-[^-]'; then
+  echo "sqitch.plan: lines that exist on $base were changed or removed" >&2
+  exit 1
+fi
+
+echo "== snapshots are not edited"
+edited=$(git diff --name-only --diff-filter=MD "$base" -- 'database/*@*.sql')
+if [ -n "$edited" ]; then
+  echo "edited rework snapshots: $edited" >&2
+  exit 1
+fi
+
+echo "== fresh database: deploy the whole plan"
+dropdb --if-exists "$scratch"
+createdb "$scratch"
+sqitch deploy --verify "$target"
+
+# Count the changes (not tags) this branch adds to the plan, and step back that
+# many from the end. Change names are ambiguous once reworked; positions are not.
+added=$(git diff -U0 "$base" -- database/sqitch.plan | grep -cE '^\+[^+@%#[:space:]]' || true)
+if [ "$added" -gt 0 ]; then
+  echo "== revert this branch's $added changes and deploy them again"
+  sqitch rebase -y --onto "@HEAD^$added" --verify "$target"
+fi
+
+dropdb "$scratch"
+echo "== database checks passed"

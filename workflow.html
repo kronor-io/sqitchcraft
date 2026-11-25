@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One change · sqitchcraft</title>
+<meta name="description" content="Two developers change an invoice table three times. Every command and every line of output, from the edit to the deploy.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html" aria-current="page">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ol>
+      <li><a href="#start">The starting point</a></li>
+      <li><a href="#simple">A simple change: due_on</a></li>
+      <li><a href="#hard">A harder one: amount</a></li>
+      <li><a href="#lint">What the linter says</a></li>
+      <li><a href="#deploy">Deploy</a></li>
+      <li><a href="#releases">Changes that take two releases</a></li>
+      <li><a href="#new">New objects</a></li>
+    </ol>
+  </nav>
+
+  <article>
+    <h1>One change, end to end</h1>
+    <p class="lede">Ana and Ben work on a shop's billing database. Over one morning they change the invoice table three times. Follow them, and you will have seen everything the tools do for an ordinary change, and where they stop and ask you to decide.</p>
+    <p class="outcome">Everything below is real: we ran these commands with sqiff 0.1.2.0, sqint 0.1.0.2, sqitch 1.5.2 and PostgreSQL 18, and copied the output. Only long lines are wrapped.</p>
+
+    <h2 id="start">The starting point</h2>
+    <p>Ana created the table in March with <code>create-migration table --schema billing --table-name invoice</code>, filled in the columns, and added a view the finance dashboard reads.</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">deploy/billing/table/invoice.sql</p>
+<pre data-lang="sql">BEGIN;
+
+    create table if not exists billing.invoice (
+        id bigint generated always as identity primary key,
+        customer_email text not null,
+        amount integer not null,
+        issued_on date not null,
+        created_at timestamptz not null default clock_timestamp()
+    );
+
+    comment on table billing.invoice is
+      'An invoice sent to a customer.';
+
+    comment on column billing.invoice.amount is
+      'What the customer owes, in whole currency units.';
+
+COMMIT;</pre>
+      </div>
+      <div class="pane">
+        <p class="pane-label">deploy/billing/view/daily_invoiced.sql</p>
+<pre data-lang="sql">BEGIN;
+
+    create or replace view billing.daily_invoiced as
+    select issued_on, sum(amount) as total
+    from billing.invoice
+    group by issued_on;
+
+    comment on view billing.daily_invoiced is
+      'Total invoiced per day, for the finance dashboard.';
+
+COMMIT;</pre>
+      </div>
+    </div>
+    <p>To follow along you need sqitch, PostgreSQL, sqiff and sqint. With Nix, one command gives you all four:</p>
+<pre data-lang="shell">nix shell nixpkgs#sqitchPg nixpkgs#postgresql_18 github:kronor-io/sqiff github:kronor-io/sqint</pre>
+
+    <h2 id="simple">A simple change: <code>due_on</code></h2>
+    <p>Ben needs to record when an invoice is due. He adds one line to the definition:</p>
+<pre data-lang="sql">@@ -7,6 +7,7 @@ BEGIN;
+         customer_email text not null,
+         amount integer not null,
+         issued_on date not null,
+<span class="add">+        due_on date,</span>
+         created_at timestamptz not null default clock_timestamp()
+     );</pre>
+    <p>Then asks sqiff what an existing database needs:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql
+<span class="c">-- table column billing.invoice.due_on</span>
+alter table billing.invoice add column due_on date;</pre>
+    <p>No hazards: a nullable column without a default is a catalog change. sqiff compared the file on <code>master</code> with his edit by building both in a transaction it rolled back, and reading the result from PostgreSQL's catalogs, so it is the database's own opinion of the difference, not a guess from parsing SQL. He writes it:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql --write
+Created database/deploy/migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on.sql
+Created database/revert/migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on.sql
+Created database/verify/migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on.sql
+Added "migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on" to database/sqitch.plan
+Tagged "migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on" with @2026-11-25_sqiff in database/sqitch.plan
+Added "billing/table/invoice [billing/table/invoice@2026-11-25_sqiff]" to database/sqitch.plan.
+…
+added migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on
+reworked billing/table/invoice</pre>
+    <p>Because <code>sqiff.yaml</code> points at create-migration's templates, the migration is the same one <code>create-migration add-column</code> would have written, with the type filled in:</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">deploy</p>
+<pre data-lang="sql">set lock_timeout to '50ms';
+set statement_timeout to '50ms';
+
+begin;
+
+alter table billing.invoice
+    add column if not exists due_on date;
+
+commit;</pre>
+      </div>
+      <div class="pane">
+        <p class="pane-label">revert</p>
+<pre data-lang="sql">begin;
+
+    alter table billing.invoice
+        drop column if exists due_on;
+
+commit;</pre>
+      </div>
+    </div>
+    <p>The deploy on his local database shows the rework doing its job: the migration adds the column, and the definition's <code>if not exists</code> finds the table already there.</p>
+<pre data-lang="shell"><span class="p">$ </span>sqitch deploy
+Deploying changes to db:pg:shop
+  + migrations/2026/11/2026-11-25-100552-add-column-billing.invoice.due_on @2026-11-25_sqiff .. ok
+  + billing/table/invoice .. psql:database/deploy/billing/table/invoice.sql:12: NOTICE:  relation "invoice" already exists, skipping
+ok</pre>
+
+    <h2 id="hard">A harder one: <code>amount</code></h2>
+    <p>Partial refunds have started producing amounts with cents. Ana changes <code>amount</code> to <code>numeric(12,2)</code>, and while she is there adds the index on <code>customer_email</code> that support has been asking for:</p>
+<pre data-lang="sql">     create table if not exists billing.invoice (
+         id bigint generated always as identity primary key,
+         customer_email text not null,
+<span class="del">-        amount integer not null,</span>
+<span class="add">+        amount numeric(12,2) not null,</span>
+         issued_on date not null,
+         due_on date,
+         created_at timestamptz not null default clock_timestamp()
+@@ -15,6 +15,9 @@ BEGIN;
+     comment on column billing.invoice.amount is
+<span class="del">-      'What the customer owes, in whole currency units.';</span>
+<span class="add">+      'What the customer owes, to the cent.';</span>
+<span class="add">+</span>
+<span class="add">+    create index if not exists invoice_customer_email</span>
+<span class="add">+        on billing.invoice (customer_email);</span></pre>
+    <p>Three lines of diff. Here is what they cost on a database that has the table:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql
+<span class="c">-- billing.invoice.amount
+--   dropped and created again around it
+--     view billing.daily_invoiced
+
+-- table column billing.invoice.amount</span>
+<span class="w">-- hazard: rewrites the table and its indexes
+-- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+-- hazard: fails when an existing value does not convert to the new type
+-- hazard: recreating a view fails when its query relies on the old type; then edit the view</span>
+drop view billing.daily_invoiced;
+alter table billing.invoice alter column amount type numeric(12,2) using amount::numeric(12,2);
+create view billing.daily_invoiced as
+SELECT issued_on,
+    sum(amount) AS total
+   FROM billing.invoice
+  GROUP BY issued_on;
+comment on view billing.daily_invoiced is 'Total invoiced per day, for the finance dashboard.';
+
+<span class="c">-- index billing.invoice_customer_email
+-- outside a transaction</span>
+<span class="w">-- hazard: builds an index</span>
+do $$
+begin
+    if exists (
+        select from pg_index
+        where indexrelid = to_regclass('billing.invoice_customer_email') and not indisvalid
+    ) then
+        raise exception using message = 'index billing.invoice_customer_email is invalid from an earlier failed build; drop it first';
+    end if;
+end
+$$;
+
+CREATE INDEX CONCURRENTLY invoice_customer_email ON billing.invoice USING btree (customer_email);
+
+<span class="c">-- table column billing.invoice.amount</span>
+comment on column billing.invoice.amount is 'What the customer owes, to the cent.';</pre>
+    <p>Read it the way a reviewer would.</p>
+    <ul>
+      <li><strong>The view.</strong> PostgreSQL will not change the type of a column a view reads. sqiff found <code>daily_invoiced</code> in the catalog, drops it, and recreates it with its comment. Ana never mentioned the view.</li>
+      <li><strong>The rewrite.</strong> <code>integer</code> to <code>numeric</code> is not binary compatible, so PostgreSQL rewrites the table while holding a lock that blocks reads and writes. On a table of a few thousand rows, that is a blink. On a hundred million, it is an outage. This is the decision sqiff leaves to a human.</li>
+      <li><strong>The index.</strong> It goes in a change of its own, built <code>concurrently</code> so writes continue, outside a transaction because PostgreSQL requires it. The guard in front stops the deploy if an earlier attempt left an invalid index behind, instead of silently skipping it.</li>
+    </ul>
+    <p>The invoice table is small, so Ana accepts the rewrite and writes it:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql --write
+billing.invoice.amount
+  dropped and created again around it
+    view billing.daily_invoiced
+Created database/deploy/migrations/2026/11/2026-11-25-100616-alter-billing.invoice.amount.sql
+…
+Created database/deploy/billing/table/invoice/index/invoice_customer_email.sql
+…
+Created database/deploy/migrations/2026/11/2026-11-25-100617-comment-billing.invoice.amount.sql
+…
+Tagged "migrations/2026/11/2026-11-25-100617-comment-billing.invoice.amount" with @2026-11-25_sqiff_2 in database/sqitch.plan
+Added "billing/table/invoice [billing/table/invoice@2026-11-25_sqiff_2]" to database/sqitch.plan.
+…
+added migrations/2026/11/2026-11-25-100616-alter-billing.invoice.amount
+added billing/table/invoice/index/invoice_customer_email
+added migrations/2026/11/2026-11-25-100617-comment-billing.invoice.amount
+reworked billing/table/invoice</pre>
+    <p>The migration carries its hazards as comments, so they reach the reviewer and anyone who reads the file later:</p>
+    <p class="filename">deploy/migrations/2026/11/2026-11-25-100616-alter-billing.invoice.amount.sql</p>
+<pre data-lang="sql">BEGIN;
+
+  -- Do not remove this line
+  select set_config('lock_timeout', '50ms', false);
+
+<span class="w">  -- hazard: rewrites the table and its indexes
+  -- hazard: holds an ACCESS EXCLUSIVE lock, which blocks reads and writes, while it runs
+  -- hazard: fails when an existing value does not convert to the new type
+  -- hazard: recreating a view fails when its query relies on the old type; then edit the view</span>
+  drop view billing.daily_invoiced;
+  alter table billing.invoice alter column amount type numeric(12,2) using amount::numeric(12,2);
+  create view billing.daily_invoiced as
+  SELECT issued_on,
+      sum(amount) AS total
+     FROM billing.invoice
+    GROUP BY issued_on;
+  comment on view billing.daily_invoiced is 'Total invoiced per day, for the finance dashboard.';
+
+COMMIT;</pre>
+    <p>Its revert goes back to <code>integer</code> the same way, view included. Reverting cannot bring back cents that the cast to <code>integer</code> rounds away; a revert restores the shape of the schema, not data that was lost.</p>
+    <div class="callout">
+      <p><strong>When sqiff asks instead.</strong> If you drop a column and add another of the same type, sqiff will not guess whether it is a rename: it stops and asks you to say <code>--rename old:new</code> or <code>--drop-and-add</code>. It does not drop data on a hunch.</p>
+    </div>
+
+    <h2 id="lint">What the linter says</h2>
+    <p>sqint reads the deploy scripts on the branch with PostgreSQL's own parser. It needs no database, so it runs in a pre-commit hook in a fraction of a second:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqint $(git diff --cached --name-only --diff-filter=AM master -- database/deploy)
+<span class="w">WARN</span> database/deploy/billing/table/invoice.sql:20 [lock/create-index] CREATE INDEX (non-concurrent) — Share lock blocks writes for the duration of the build
+<span class="b">BLOCK</span> database/deploy/migrations/2026/11/2026-11-25-100616-alter-billing.invoice.amount.sql:13 [lock/alter-column-type] ALTER COLUMN TYPE — table rewrite under AccessExclusiveLock unless binary-coercible
+1 informational or suppressed finding hidden — pass --verbose to show.</pre>
+    <p>Two findings, and both deserve an answer in the code rather than a shrug in the review:</p>
+    <ul>
+      <li><strong>The BLOCK</strong> is the rewrite sqiff already warned about. sqint and sqiff agree; Ana made the call. She records it on the statement, so the next reader knows it was a decision.</li>
+      <li><strong>The WARN</strong> is on the definition's <code>create index if not exists</code>. On every existing database the concurrent change has already built the index, so this line does nothing. It is still worth one line to say so.</li>
+    </ul>
+<pre data-lang="sql"><span class="add">+  -- lint:ignore reason="invoice has a few thousand rows; the rewrite takes milliseconds"</span>
+   alter table billing.invoice alter column amount type numeric(12,2) using amount::numeric(12,2);</pre>
+<pre data-lang="sql"><span class="add">+    -- lint:ignore reason="no-op: billing/table/invoice/index/invoice_customer_email builds it concurrently first"</span>
+     create index if not exists invoice_customer_email
+         on billing.invoice (customer_email);</pre>
+<pre data-lang="shell"><span class="p">$ </span>sqint --verbose database/deploy/billing/table/invoice.sql
+SUPPRESSED database/deploy/billing/table/invoice.sql:22 [lock/create-index] CREATE INDEX (non-concurrent) — Share lock blocks writes for the duration of the build
+        reason: no-op: billing/table/invoice/index/invoice_customer_email builds it concurrently first</pre>
+    <p>A suppression without a reason is itself reported. In CI, sqint's second pass deploys each change into a scratch database and reports the locks it really took; see <a href="pipeline.html#ci">shipping safely</a>.</p>
+    <p>If your services use hasql-th, this is also where <a href="tools.html#hasql-check">hasql-check</a> earns its place: a query that still reads <code>amount :: int4</code> keeps working after this change but loses the cents, and <code>hasql-check --types</code> reports it as a narrowing cast.</p>
+
+    <h2 id="deploy">Deploy</h2>
+    <p>After review, the branch merges and deploys. In production the client is psql-retry, so a migration that cannot get its lock within 50&nbsp;ms gives up, lets the traffic it was blocking through, and tries again:</p>
+<pre data-lang="shell">sqitch deploy --client database/psql-retry.sh db:pg://deploy@db.internal/shop</pre>
+    <p><a href="pipeline.html#locks">Why 50&nbsp;ms, and what psql-retry does</a>.</p>
+    <p>Meanwhile Ben has added <code>paid_at</code> on another branch, from the <code>master</code> he had before Ana merged. Both of them appended to <code>sqitch.plan</code>, and git will say so. That story is on <a href="git.html#conflicts">the next page</a>.</p>
+
+    <h2 id="releases">Changes that take two releases</h2>
+    <p>Some changes cannot be read off the final definition, because the application has to change in the middle. create-migration has recipes for them, each one a series of changes you deploy across releases.</p>
+    <h3>A <code>not null</code> column on a big table</h3>
+<pre data-lang="shell">create-migration non-nullable-column --schema billing --table-name invoice --column-name currency</pre>
+    <ol>
+      <li><code>add_column</code>: the column, nullable. A catalog change.</li>
+      <li><strong>Before the next step ships, every insert must set the column</strong>, through the application, a default or a <code>before</code> trigger. The next step starts rejecting rows without it.</li>
+      <li><code>add_not_null_constraint</code>: <code>check (currency is not null) not valid</code>. New writes are checked; existing rows are not scanned.</li>
+      <li><code>bulk_update</code>: backfill existing rows in batches, committing between them.</li>
+      <li><code>validate_constraint</code>: one scan under a lock that does not block reads or writes.</li>
+      <li><code>make_column_not_null</code>: <code>set not null</code>, which PostgreSQL proves from the validated check without scanning, then drops the check.</li>
+    </ol>
+    <h3>Renaming a column</h3>
+    <div class="lanes">
+      <div class="lane"><span>Release 1</span><ol><li>rename-column-step-1</li><li>new column + sync trigger + backfill</li></ol></div>
+      <div class="lane"><span>Application</span><ol><li>read and write the new name</li></ol></div>
+      <div class="lane"><span>Release 2</span><ol><li>rename-column-step-2</li><li>drop old column and trigger</li></ol></div>
+    </div>
+    <p>Between the releases both names work, so old and new application code can run side by side during the rollout.</p>
+
+    <h2 id="new">New objects</h2>
+    <p>For something that does not exist yet, start from a template. create-migration names the change, writes the three scripts, and adds it to the plan:</p>
+<pre data-lang="shell"><span class="p">$ </span>create-migration table --schema billing --table-name invoice
+Created database/deploy/billing/table/invoice.sql
+Created database/revert/billing/table/invoice.sql
+Created database/verify/billing/table/invoice.sql
+Added "billing/table/invoice" to database/sqitch.plan</pre>
+    <p>Leave out a flag and it asks, completing schema and table names from your <code>deploy/</code> folders. There are templates for views, functions, triggers, domains and statechart callbacks; <a href="tools.html#create-migration">the full list</a>.</p>
+
+    <div class="next">
+      <a href="layout.html">The layout</a>
+      <a href="functions.html">Next: functions and views</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>

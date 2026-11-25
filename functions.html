@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Functions and views · sqitchcraft</title>
+<meta name="description" content="Add a PostgreSQL function, change its body, change its signature, and survive a column rename it depends on, with real output from sqitch, sqiff, sqint and PostgreSQL.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html" aria-current="page">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ol>
+      <li><a href="#add">Add a function</a></li>
+      <li><a href="#body">Change its body</a></li>
+      <li><a href="#signature">Change its signature</a></li>
+      <li><a href="#broken">When a table change breaks it</a></li>
+      <li><a href="#history">Its history</a></li>
+      <li><a href="#views">Views</a></li>
+      <li><a href="#rules">The rules, in short</a></li>
+    </ol>
+  </nav>
+
+  <article>
+    <h1>Functions and views</h1>
+    <p class="lede">A table changes through migrations, because its rows have to survive. A function or a view has no rows: you can replace it whole. That makes them the easiest objects to keep in one file, and the place where that file pays off most.</p>
+    <p class="outcome">The same example project, later the same day: Ana and Ben add a function, change it three times, and rename a column it depends on. Every output below was captured from those runs.</p>
+
+    <h2 id="add">1. Add a function</h2>
+    <p>Support wants to know what a customer still owes. Ana starts from a template:</p>
+<pre data-lang="shell"><span class="p">$ </span>create-migration function general --schema billing --function-name outstanding_for
+Created database/deploy/billing/function/outstanding_for.sql
+Created database/revert/billing/function/outstanding_for.sql
+Created database/verify/billing/function/outstanding_for.sql
+Added "billing/function/outstanding_for" to database/sqitch.plan</pre>
+    <p>The template is a placeholder PL/pgSQL function to fill in. She replaces it with what she means, and makes the verify script call the function, so a deploy fails if the function cannot run:</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">deploy/billing/function/outstanding_for.sql</p>
+<pre data-lang="sql">BEGIN;
+
+    create or replace function billing.outstanding_for(email text)
+        returns numeric(12,2)
+        language sql
+        stable
+    as $$
+        select coalesce(sum(amount), 0)
+        from billing.invoice
+        where customer_email = email
+          and paid_at is null;
+    $$;
+
+    comment on function billing.outstanding_for(text) is
+      'What a customer still owes across all their unpaid invoices.';
+
+COMMIT;</pre>
+      </div>
+      <div class="pane">
+        <p class="pane-label">verify/billing/function/outstanding_for.sql</p>
+<pre data-lang="sql">BEGIN;
+
+    select billing.outstanding_for('nobody@example.com');
+
+ROLLBACK;</pre>
+        <p class="pane-note">The revert the template wrote is <code>drop function if exists billing.outstanding_for;</code>, which is right for a function that did not exist before.</p>
+      </div>
+    </div>
+<pre data-lang="shell"><span class="p">$ </span>sqitch deploy
+Deploying changes to db:pg:shop
+  + billing/function/outstanding_for .. ok
+<span class="p">$ </span>psql -Atc "select billing.outstanding_for('ana@example.com')"
+200.50</pre>
+    <p>Ana has two unpaid invoices: 120.50, issued three days ago, and 80.00, dated two days from now.</p>
+
+    <h2 id="body">2. Change its body</h2>
+    <p>Support notices the 80.00: an invoice dated next week is not owed yet. Ben needs one more condition. The function is deployed, so its script is history; he reworks it, and sqitch wants a tag to mark where the old version ends:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqitch rework billing/function/outstanding_for -n "Leave out invoices issued in the future"
+Cannot rework "billing/function/outstanding_for" without an intervening tag.
+Use "sqitch tag" to create a tag and try again
+
+<span class="p">$ </span>sqitch tag @2026-11-25_outstanding -n "before outstanding_for skips future invoices"
+Tagged "billing/function/outstanding_for" with @2026-11-25_outstanding in database/sqitch.plan
+
+<span class="p">$ </span>sqitch rework billing/function/outstanding_for -n "Leave out invoices issued in the future"
+Added "billing/function/outstanding_for [billing/function/outstanding_for@2026-11-25_outstanding]" to database/sqitch.plan.
+Modify these files as appropriate:
+  * database/deploy/billing/function/outstanding_for.sql
+  * database/revert/billing/function/outstanding_for.sql
+  * database/verify/billing/function/outstanding_for.sql</pre>
+    <p>sqitch has copied the deploy script to <code>outstanding_for@2026-11-25_outstanding.sql</code> and made the old deploy script the new revert script. Ben edits the function where it is. Here is his pull request next to the same change in a numbered-migrations project:</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">A rework</p>
+        <p class="pane-sub">git diff, deploy/billing/function/outstanding_for.sql</p>
+<pre data-lang="sql">@@ -10,10 +10,11 @@ BEGIN;
+         select coalesce(sum(amount), 0)
+         from billing.invoice
+         where customer_email = email
+<span class="del">-          and paid_at is null;</span>
+<span class="add">+          and paid_at is null</span>
+<span class="add">+          and issued_on &lt;= current_date;</span>
+     $$;
+
+     comment on function billing.outstanding_for(text) is
+<span class="del">-      'What a customer still owes across all their unpaid invoices.';</span>
+<span class="add">+      'What a customer still owes across all their unpaid invoices issued so far.';</span></pre>
+        <p class="pane-note">The reviewer sees the one condition that changed, in the context of the function.</p>
+      </div>
+      <div class="pane dim">
+        <p class="pane-label">A new migration</p>
+        <p class="pane-sub">The same change, as numbered migrations would have it</p>
+<pre data-lang="sql"><span class="add">+create or replace function billing.outstanding_for(email text)</span>
+<span class="add">+    returns numeric(12,2)</span>
+<span class="add">+    language sql</span>
+<span class="add">+    stable</span>
+<span class="add">+as $$</span>
+<span class="add">+    select coalesce(sum(amount), 0)</span>
+<span class="add">+    from billing.invoice</span>
+<span class="add">+    where customer_email = email</span>
+<span class="add">+      and paid_at is null</span>
+<span class="add">+      and issued_on &lt;= current_date;</span>
+<span class="add">+$$;</span></pre>
+        <p class="pane-note">The whole function, copied into a new file. Spot the change. Now imagine it is 200 lines of PL/pgSQL.</p>
+      </div>
+    </div>
+    <p>git sees the snapshots for what they are:</p>
+<pre data-lang="gitout"><span class="p">$ </span>git diff --cached --stat -C
+ database/deploy/billing/function/outstanding_for.sql     |  5 +++--
+ ...or.sql => outstanding_for@2026-11-25_outstanding.sql} |  0
+ database/revert/billing/function/outstanding_for.sql     | 16 ++++++++++++++--
+ ...or.sql => outstanding_for@2026-11-25_outstanding.sql} |  0
+ database/sqitch.plan                                     |  2 ++
+ .../function/outstanding_for@2026-11-25_outstanding.sql  |  7 +++++++
+ 6 files changed, 26 insertions(+), 4 deletions(-)</pre>
+    <p>Deploying replaces the function; reverting puts the previous one back. Both are checked here against the same data:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqitch deploy
+  + billing/function/outstanding_for .. ok
+<span class="p">$ </span>psql -Atc "select billing.outstanding_for('ana@example.com')"
+120.50
+<span class="p">$ </span>sqitch revert -y --to @2026-11-25_outstanding
+  - billing/function/outstanding_for .. ok
+<span class="p">$ </span>psql -Atc "select billing.outstanding_for('ana@example.com')"
+200.50</pre>
+
+    <h2 id="signature">3. Change its signature</h2>
+    <p>Finance wants to ask what a customer owed at the end of last month. Ana adds a date argument, defaulting to today so existing callers keep working. The obvious edit is to add the argument and keep <code>create or replace</code>. PostgreSQL accepts it, and that is the problem:</p>
+<pre data-lang="shell"><span class="p">=# </span>create or replace function billing.outstanding_for(email text, as_of date default current_date) …
+CREATE FUNCTION
+<span class="p">=# </span>\df billing.outstanding_for
+ Schema  |      Name       | Result data type |             Argument data types
+---------+-----------------+------------------+---------------------------------------------
+ billing | outstanding_for | numeric          | email text
+ billing | outstanding_for | numeric          | email text, as_of date DEFAULT CURRENT_DATE
+<span class="p">=# </span>select billing.outstanding_for('ana@example.com');
+<span class="b">ERROR:  function billing.outstanding_for(unknown) is not unique</span>
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.</pre>
+    <p>A function is identified by its name and argument types, so a new argument makes a new function. The old one stays, and every existing one-argument call now matches both. Two other signature changes are refused outright:</p>
+<pre data-lang="plain"><span class="c">-- returns bigint instead of numeric</span>
+<span class="b">ERROR:  cannot change return type of existing function</span>
+HINT:  Use DROP FUNCTION billing.outstanding_for(text) first.
+
+<span class="c">-- the parameter called customer_email instead of email</span>
+<span class="b">ERROR:  cannot change name of input parameter "email"</span>
+HINT:  Use DROP FUNCTION billing.outstanding_for(text) first.</pre>
+    <p>So the definition drops the old signature and creates the new one, in one transaction so no caller sees neither. Both statements are safe to run again, which a definition must be:</p>
+<pre data-lang="sql">@@ -2,7 +2,11 @@
+
+ BEGIN;
+
+<span class="del">-    create or replace function billing.outstanding_for(email text)</span>
+<span class="add">+    -- A new argument is a new function: drop the old one, or both would exist</span>
+<span class="add">+    -- and every one-argument call would become ambiguous.</span>
+<span class="add">+    drop function if exists billing.outstanding_for(text);</span>
+<span class="add">+</span>
+<span class="add">+    create or replace function billing.outstanding_for(email text, as_of date default current_date)</span>
+         returns numeric(12,2)
+         language sql
+         stable
+@@ -11,10 +15,10 @@ BEGIN;
+         from billing.invoice
+         where customer_email = email
+           and paid_at is null
+<span class="del">-          and issued_on &lt;= current_date;</span>
+<span class="add">+          and issued_on &lt;= as_of;</span>
+     $$;</pre>
+<pre data-lang="shell"><span class="p">$ </span>psql -Atc "select billing.outstanding_for('ana@example.com'), billing.outstanding_for('ana@example.com', current_date + 5)"
+120.50|200.50</pre>
+    <p>Old calls still work through the default. Two more things to know about the drop. It takes the function's grants and comment with it, so the definition has to add them again; this one restates its comment, and a function with grants would restate those too. And it fails if a view or another object depends on the function; then those have to be dropped and created around it.</p>
+    <div class="callout warn">
+      <p><strong>The revert needs the same care.</strong> sqitch made the previous deploy script the revert script, and that script only creates the one-argument function. Ana tried it before editing it:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqitch revert -y --to @2026-11-25_as_of
+  - billing/function/outstanding_for .. ok
+<span class="p">$ </span>psql -c "select billing.outstanding_for('ana@example.com')"
+<span class="b">ERROR:  function billing.outstanding_for(unknown) is not unique</span></pre>
+      <p>The revert has to drop the new signature first:</p>
+<pre data-lang="sql">  BEGIN;
+
+<span class="add">+     drop function if exists billing.outstanding_for(text, date);</span>
+<span class="add">+</span>
+      create or replace function billing.outstanding_for(email text)</pre>
+    </div>
+
+    <h2 id="broken">4. When a table change breaks it</h2>
+    <p>Refunds settle invoices too, so Ben renames <code>paid_at</code> to <code>settled_at</code> in the table's file. The function reads <code>paid_at</code>. A SQL function's body is checked when it is created, not when the tables it reads change, so PostgreSQL will happily rename the column and leave the function broken until someone calls it.</p>
+    <p>sqiff notices the name first. It also asks, as it always does when a column disappears and another of the same type appears:</p>
+<pre data-lang="shell"><span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql
+<span class="c">-- billing.invoice.paid_at
+--   named in
+--     billing.outstanding_for
+-- paid_at is dropped and settled_at added with the same type; pass --rename paid_at:settled_at if it is a rename, or --drop-and-add if it is not</span>
+…
+<span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql --rename paid_at:settled_at
+<span class="c">-- billing.invoice.paid_at
+--   named in
+--     billing.outstanding_for
+
+-- table column billing.invoice.settled_at</span>
+<span class="w">-- hazard: breaks running code that still uses the old name</span>
+alter table billing.invoice rename column paid_at to settled_at;</pre>
+    <p>sqiff found the name in the function's body. With the plpgsql_check extension installed it also follows dependencies into PL/pgSQL. Then sqint's dynamic pass deploys the change into a scratch database and settles it:</p>
+<pre data-lang="plain"><span class="b">BLOCK</span> database/deploy/migrations/2026/11/2026-11-25-104309-rename-billing.invoice.settled_at.sql:3 [function/broken-body] `billing.outstanding_for(text,date)` is broken after deploying `migrations/2026/11/2026-11-25-104309-rename-billing.invoice.settled_at`
+        Postgres rejects the current definition of `billing.outstanding_for(text,date)` once `migrations/2026/11/2026-11-25-104309-rename-billing.invoice.settled_at` is deployed: column "paid_at" does not exist. No later change in this PR fixes it, so it stays broken after the deploy. Sqitch commits each change on its own, so every call to the function fails for as long as it is broken. Redefine the function in the same change that breaks it (for a new column, inside the migration's transaction).</pre>
+    <p>The advice is the important part: reworking the function in a later change would not be enough, because sqitch commits each change separately and the function would be broken in between. So Ben does two things.</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">Redefine it in the migration</p>
+        <p class="pane-sub">deploy/migrations/2026/11/…-rename-billing.invoice.settled_at.sql</p>
+<pre data-lang="sql">BEGIN;
+
+  -- Do not remove this line
+  select set_config('lock_timeout', '50ms', false);
+
+  -- hazard: breaks running code that still uses the old name
+  alter table billing.invoice
+      rename column paid_at to settled_at;
+
+  -- billing.outstanding_for reads this column by name. Redefine it in the
+  -- same transaction, so no call ever sees it broken.
+  create or replace function billing.outstanding_for(email text, as_of date default current_date)
+      returns numeric(12,2)
+      language sql
+      stable
+  as $$
+      select coalesce(sum(amount), 0)
+      from billing.invoice
+      where customer_email = email
+        and settled_at is null
+        and issued_on &lt;= as_of;
+  $$;
+
+COMMIT;</pre>
+      </div>
+      <div class="pane">
+        <p class="pane-label">Rework the definition to match</p>
+        <p class="pane-sub">deploy/billing/function/outstanding_for.sql</p>
+<pre data-lang="sql">@@ -14,7 +14,7 @@ BEGIN;
+         select coalesce(sum(amount), 0)
+         from billing.invoice
+         where customer_email = email
+<span class="del">-          and paid_at is null</span>
+<span class="add">+          and settled_at is null</span>
+           and issued_on &lt;= as_of;
+     $$;</pre>
+        <p class="pane-note">The migration keeps production working; the rework keeps the file truthful, so the next reader sees <code>settled_at</code>. The migration comes first in the plan, so on deploy the rework finds the function already in this shape.</p>
+      </div>
+    </div>
+<pre data-lang="shell"><span class="p">$ </span>sqitch deploy
+<span class="p">$ </span>psql -Atc "select billing.outstanding_for('ana@example.com')"
+120.50</pre>
+    <h3>And the way back</h3>
+    <p>We first stopped there, and the plan deployed cleanly. Then <a href="agents.html#check">the check script</a> reverted the branch's changes, and failed:</p>
+<pre data-lang="shell"><span class="p">$ </span>scripts/check-database HEAD~1
+…
+== revert this branch's 3 changes and deploy them again
+psql:database/revert/billing/function/outstanding_for.sql:19: <span class="b">ERROR:  column "paid_at" does not exist</span>
+not ok</pre>
+    <p>Reverts run in reverse plan order, so the function rework is undone first. Its revert script, which sqitch made from the previous definition, recreated the function reading <code>paid_at</code>, while the migration that renamed the column was still in place. PostgreSQL checks a SQL function's body when it is created, and refused.</p>
+    <p>The fix mirrors the deploy. The migration owns the function's change in both directions, and the rework only keeps the file truthful:</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">The migration's revert</p>
+        <p class="pane-sub">revert/migrations/2026/11/…-rename-billing.invoice.settled_at.sql</p>
+<pre data-lang="sql">  alter table billing.invoice
+      rename column settled_at to paid_at;
+
+  -- The deploy redefined billing.outstanding_for for the new name; put back the
+  -- definition that reads the old one, in the same transaction.
+  create or replace function billing.outstanding_for(email text, as_of date default current_date)
+      …
+        and paid_at is null
+      …</pre>
+      </div>
+      <div class="pane">
+        <p class="pane-label">The rework's revert</p>
+        <p class="pane-sub">revert/billing/function/outstanding_for.sql</p>
+<pre data-lang="sql">    -- This rework only brought the definition in line with the rename migration,
+    -- which changed the function itself. When this revert runs, that migration
+    -- is still deployed and the column is still settled_at, so the function
+    -- stays as it is; the migration's revert puts back the paid_at version.
+    create or replace function billing.outstanding_for(email text, as_of date default current_date)
+      …
+          and settled_at is null
+      …</pre>
+      </div>
+    </div>
+<pre data-lang="shell"><span class="p">$ </span>scripts/check-database HEAD~1
+…
+== revert this branch's 3 changes and deploy them again
+== database checks passed</pre>
+    <p>A deploy that works says nothing about its revert. Check both, every time.</p>
+    <p>The rename itself is still a breaking change for application code that reads <code>paid_at</code>; sqiff's hazard says so. On a live system you would use the <a href="workflow.html#releases">two-release rename</a> instead, and redefine the function in its first step the same way.</p>
+
+    <h2 id="history">5. Its history</h2>
+    <p>Four commits touched the function. Each line of its file points at the one that last meant to change it:</p>
+<pre data-lang="gitout"><span class="p">$ </span>git log --format='%h %an %s' -- database/deploy/billing/function/outstanding_for.sql
+2c86364 Ben Okafor Call it settled_at: refunds settle invoices too
+ee678f6 Ana Lima Ask what a customer owed on a given day
+6f02996 Ben Okafor Leave invoices issued in the future out of what a customer owes
+ef17119 Ana Lima Add what a customer still owes
+
+<span class="p">$ </span>git blame -s database/deploy/billing/function/outstanding_for.sql
+ee678f69  7)     drop function if exists billing.outstanding_for(text);
+ee678f69  8)
+ee678f69  9)     create or replace function billing.outstanding_for(email text, as_of date default current_date)
+ef171198 10)         returns numeric(12,2)
+ef171198 11)         language sql
+ef171198 12)         stable
+ef171198 13)     as $$
+ef171198 14)         select coalesce(sum(amount), 0)
+ef171198 15)         from billing.invoice
+ef171198 16)         where customer_email = email
+2c863649 17)           and settled_at is null
+ee678f69 18)           and issued_on &lt;= as_of;
+ef171198 19)     $$;</pre>
+    <p>With each version copied into a new migration, blame on the newest copy would credit every line to whoever made the last copy.</p>
+
+    <h2 id="views">6. Views</h2>
+    <p>A view works like a function: one file under <code>view/</code>, changed with <code>sqitch rework</code>, replaced whole with <code>create or replace view</code>. PostgreSQL limits what a replacement may change, though. Tried on <code>billing.daily_invoiced</code>:</p>
+<pre data-lang="plain"><span class="c">-- add a column at the end</span>
+CREATE VIEW
+
+<span class="c">-- rename issued_on to day</span>
+<span class="b">ERROR:  cannot change name of view column "issued_on" to "day"</span>
+HINT:  Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.
+
+<span class="c">-- leave out the total column</span>
+<span class="b">ERROR:  cannot drop columns from view</span></pre>
+    <ul>
+      <li><strong>Adding columns at the end</strong> is a plain rework.</li>
+      <li><strong>Renaming or removing a column</strong> needs <code>drop view</code> then <code>create view</code> in the definition, with its comment and grants again, and anything that reads the view dropped and recreated around it.</li>
+      <li><strong>Changing a table a view reads</strong> is sqiff's job: in <a href="workflow.html#hard">the amount change</a> it dropped and recreated <code>daily_invoiced</code> around the type change without being asked.</li>
+    </ul>
+
+    <h2 id="rules">The rules, in short</h2>
+    <ul>
+      <li>One file per function or view, written so it can run twice: <code>create or replace</code>, and <code>drop … if exists</code> for an old signature.</li>
+      <li>Change a deployed one with <code>sqitch rework</code>, after a tag. Edit the file in place; never the <code>@tag</code> copy.</li>
+      <li>A new argument, return type or parameter name means a new function: drop the old signature in the same definition, and fix the revert script to drop the new one.</li>
+      <li>Give new arguments defaults, so the code running during a deploy keeps calling it the old way.</li>
+      <li>When a table change breaks a function, redefine the function in the migration that breaks it, and rework the definition to match. The migration's revert puts the old function back; the rework's revert leaves the function as it is.</li>
+      <li>Make the verify script call the function, so a deploy that leaves it broken fails.</li>
+    </ul>
+
+    <div class="next">
+      <a href="workflow.html">One change, end to end</a>
+      <a href="git.html">Next: git and review</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>

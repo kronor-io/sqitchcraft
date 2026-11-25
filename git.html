@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git and review · sqitchcraft</title>
+<meta name="description" content="What a schema pull request contains, how to review it, what git blame and log tell you about a table, and how to resolve two branches that both changed sqitch.plan.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html" aria-current="page">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>
+      <li><a href="#pr">What is in the pull request</a></li>
+      <li><a href="#review">Reviewing it</a></li>
+      <li><a href="#history">History and blame</a></li>
+      <li><a href="#conflicts">Two branches, one plan</a></li>
+      <li><a href="#related">When a clean merge is wrong</a></li>
+      <li><a href="#rules">Rules worth automating</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>Schema changes in git</h1>
+    <p class="lede">Putting each object in its own file is mostly about people: the reviewer reading a pull request, the engineer asking why a column is the way it is, the two developers whose branches meet in <code>sqitch.plan</code>. This page is about them.</p>
+    <p class="outcome">The commits, diffs and conflicts here are from the example project in <a href="workflow.html">one change, end to end</a>, captured as git printed them, with paths and long lines shortened.</p>
+
+    <h2 id="pr">What is in the pull request</h2>
+    <p>Ana's change to <code>amount</code> touched three lines of the table's definition. Her commit has fifteen files:</p>
+<pre data-lang="gitout"><span class="p">$ </span>git show --stat --format= 0e7d789
+ deploy/billing/table/invoice.sql                               |  7 +++++--
+ deploy/billing/table/invoice/index/invoice_customer_email.sql  | 17 +++++++++++++++++
+ deploy/billing/table/invoice@2026-11-25_sqiff_2.sql            | 20 ++++++++++++++++++++
+ deploy/migrations/2026/11/…-alter-billing.invoice.amount.sql   | 21 ++++++++++++++++++++
+ deploy/migrations/2026/11/…-comment-billing.invoice.amount.sql | 10 ++++++++++
+ revert/billing/table/invoice.sql                               |  1 +
+ revert/billing/table/invoice/index/invoice_customer_email.sql  |  3 +++
+ revert/billing/table/invoice@2026-11-25_sqiff_2.sql            | 19 +++++++++++++++++++
+ revert/migrations/2026/11/…-alter-billing.invoice.amount.sql   | 21 ++++++++++++++++++++
+ revert/migrations/2026/11/…-comment-billing.invoice.amount.sql | 10 ++++++++++
+ sqitch.plan                                                    |  5 +++++
+ verify/billing/table/invoice/index/invoice_customer_email.sql  | 18 ++++++++++++++++++
+ verify/billing/table/invoice@2026-11-25_sqiff_2.sql            |  7 +++++++
+ verify/migrations/2026/11/…-alter-billing.invoice.amount.sql   | 15 +++++++++++++++
+ verify/migrations/2026/11/…-comment-billing.invoice.amount.sql |  7 +++++++
+ 15 files changed, 179 insertions(+), 2 deletions(-)</pre>
+    <p>That looks like a lot, so sort it by what each file is for. Only the first group was written by a person.</p>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Files</th><th>What they are</th><th>How to read them</th></tr></thead>
+      <tbody>
+        <tr><td><code>deploy/billing/table/invoice.sql</code></td><td>The intent: what the table should be</td><td>Like code. This is the diff that matters.</td></tr>
+        <tr><td><code>deploy/migrations/…</code>, <code>…/index/…</code></td><td>The effect: what runs on existing databases</td><td>Check the hazards, the locks, and that it matches the intent.</td></tr>
+        <tr><td><code>revert/…</code>, <code>verify/…</code></td><td>The way back, and the proof it worked</td><td>Skim. CI runs them.</td></tr>
+        <tr><td><code>sqitch.plan</code></td><td>The order</td><td>New lines at the end, and nothing else.</td></tr>
+        <tr><td><code>…@2026-11-25_sqiff_2.sql</code></td><td>Snapshots of the old definition</td><td>Not at all. They are copies.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>git can see that the snapshots are copies. Ask it to look for copies and they shrink to zero-line entries:</p>
+<pre data-lang="gitout"><span class="p">$ </span>git show --stat -C --format= 0e7d789
+ …
+ deploy/billing/table/{invoice.sql => invoice@2026-11-25_sqiff_2.sql} | 0
+ …
+ revert/billing/table/{invoice.sql => invoice@2026-11-25_sqiff_2.sql} | 0
+ …
+ 15 files changed, 140 insertions(+), 2 deletions(-)</pre>
+    <p>Make that the default, and tell GitHub to fold snapshots away in pull requests:</p>
+<pre data-lang="shell">git config diff.renames copies</pre>
+    <p class="filename">.gitattributes</p>
+<pre data-lang="plain">database/**/*@*.sql  linguist-generated=true</pre>
+    <p>GitHub then collapses those files in the diff view and leaves them out of language statistics. They are still in the commit, and still one click away.</p>
+
+    <h2 id="review">Reviewing it</h2>
+    <p>A schema review answers three questions, and each one has its own file.</p>
+    <div class="compare">
+      <div class="pane">
+        <p class="pane-label">1. Is this what the table should be?</p>
+        <p class="pane-sub">Read the definition's diff.</p>
+<pre data-lang="sql">@@ -5,7 +5,7 @@ BEGIN;
+     create table if not exists billing.invoice (
+         id bigint generated always as identity primary key,
+         customer_email text not null,
+<span class="del">-        amount integer not null,</span>
+<span class="add">+        amount numeric(12,2) not null,</span>
+         issued_on date not null,</pre>
+        <p class="pane-note">Context lines show the table around the change, which a bare <code>alter table</code> never does. Naming, types, nullability and comments are reviewed here, as design.</p>
+      </div>
+      <div class="pane">
+        <p class="pane-label">2. Is it safe to run on production?</p>
+        <p class="pane-sub">Read the migration, starting with its hazards.</p>
+<pre data-lang="sql"><span class="w">-- hazard: rewrites the table and its indexes
+-- hazard: holds an ACCESS EXCLUSIVE lock, which
+--         blocks reads and writes, while it runs</span>
+drop view billing.daily_invoiced;
+alter table billing.invoice alter column amount
+  type numeric(12,2) using amount::numeric(12,2);
+create view billing.daily_invoiced as …</pre>
+        <p class="pane-note">How big is the table? Is there a <code>lint:ignore</code> with a reason you believe? Does everything that reads <code>amount</code> appear here?</p>
+      </div>
+    </div>
+    <p><strong>3. Will running code survive it?</strong> The database deploys before the new application code, so the old code reads the new schema for a while. A column type change is safe for code that reads it as a number; a dropped or renamed column is not. For Haskell services, <a href="pipeline.html#compat">hasql-check answers this mechanically</a>.</p>
+
+    <h2 id="history">History and blame</h2>
+    <p>Because each line of a definition is changed by the commit that meant to change it, git's history tools work on the schema the way they work on code.</p>
+    <h3>Who touched this table, and why?</h3>
+<pre data-lang="gitout"><span class="p">$ </span>git log --format='%h %an %ad %s' --date=short -- database/deploy/billing/table/invoice.sql
+829cc60 Ben Okafor 2026-11-25 Record when an invoice was paid
+0e7d789 Ana Lima 2026-11-25 Store invoice amounts to the cent
+4a38802 Ben Okafor 2026-11-25 Record when an invoice is due
+251c6d2 Ana Lima 2026-03-02 Add invoices and the daily total view</pre>
+    <h3>Where did each column come from?</h3>
+<pre data-lang="gitout"><span class="p">$ </span>git blame --date=short database/deploy/billing/table/invoice.sql
+^251c6d2 (Ana Lima   2026-03-02  5)     create table if not exists billing.invoice (
+^251c6d2 (Ana Lima   2026-03-02  6)         id bigint generated always as identity primary key,
+^251c6d2 (Ana Lima   2026-03-02  7)         customer_email text not null,
+0e7d7894 (Ana Lima   2026-11-25  8)         amount numeric(12,2) not null,
+^251c6d2 (Ana Lima   2026-03-02  9)         issued_on date not null,
+4a38802a (Ben Okafor 2026-11-25 10)         due_on date,
+829cc609 (Ben Okafor 2026-11-25 11)         paid_at timestamptz,
+^251c6d2 (Ana Lima   2026-03-02 12)         created_at timestamptz not null default clock_timestamp()</pre>
+    <h3>What has <code>amount</code> been over time?</h3>
+<pre data-lang="gitout"><span class="p">$ </span>git log -L '/amount /,+1:database/deploy/billing/table/invoice.sql' --format='%h %an %ad %s' --date=short
+0e7d789 Ana Lima 2026-11-25 Store invoice amounts to the cent
+@@ -8,1 +8,1 @@ BEGIN;
+<span class="del">-        amount integer not null,</span>
+<span class="add">+        amount numeric(12,2) not null,</span>
+251c6d2 Ana Lima 2026-03-02 Add invoices and the daily total view
+@@ -0,0 +8,1 @@
+<span class="add">+        amount integer not null,</span></pre>
+    <p>Each answer leads to a commit that holds the edit, the migration that carried it out and the message that explains it, together. With numbered migrations, the same questions start with a full-text search across hundreds of files.</p>
+    <p>Two limits worth knowing. Blame shows the last commit to touch a line, not when that commit reached production; <code>sqitch log</code> on a database tells you that. And it shows the definition's history, not what a migration did to the data: that lives in the migration and its commit message, so write the message for the person who will read it.</p>
+
+    <h2 id="conflicts">Two branches, one plan</h2>
+    <p>Ben branched from <code>master</code> to add <code>paid_at</code> before Ana merged her change. Both of them edited <code>invoice.sql</code>, on different lines, and both appended to <code>sqitch.plan</code>. When Ben rebased onto the new <code>master</code>, git merged the definition by itself, and stopped at the plan:</p>
+<pre data-lang="plan"><span class="p">$ </span>git rebase master
+CONFLICT (content): Merge conflict in database/sqitch.plan
+
+<span class="p">$ </span>tail database/sqitch.plan
+billing/table/invoice [billing/table/invoice@2026-11-25_sqiff] … # sqiff: billing/table/invoice as edited
+&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD
+migrations/2026/11/2026-11-25-100616-alter-billing.invoice.amount … Ana Lima … # migration: alter billing.invoice.amount
+billing/table/invoice/index/invoice_customer_email … Ana Lima … # add_index: add index billing.invoice.invoice_customer_email
+migrations/2026/11/2026-11-25-100617-comment-billing.invoice.amount … Ana Lima … # migration: comment billing.invoice.amount
+@2026-11-25_sqiff_2 … Ana Lima … # sqiff: before the changes it writes
+billing/table/invoice [billing/table/invoice@2026-11-25_sqiff_2] … Ana Lima … # sqiff: billing/table/invoice as edited
+=======
+migrations/2026/11/2026-11-25-100709-add-column-billing.invoice.paid_at … Ben Okafor … # add_column: add column billing.invoice.paid_at
+@2026-11-25_paid_at … Ben Okafor … # sqiff: before the changes it writes
+billing/table/invoice [billing/table/invoice@2026-11-25_paid_at] … Ben Okafor … # sqiff: billing/table/invoice as edited
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; b1ae481 (Record when an invoice was paid)</pre>
+    <p>This conflict is expected, not a sign that something went wrong: every schema change appends to the same file. The tempting fix is to keep both blocks, Ana's first. For a hand-written migration that is exactly right. For a rework it is wrong, and the reason is worth understanding.</p>
+    <div class="callout warn">
+      <p><strong>The stale snapshot.</strong> Ben's <code>invoice@2026-11-25_paid_at.sql</code> is a copy of the definition as it was when he ran sqiff, with <code>amount integer</code> and no index. After the rebase it sits after Ana's change in the plan, so it should hold her version. For a table the harm is small, because <code>create table if not exists</code> skips a table that exists, but the file now misstates history. For a view or a function, whose scripts use <code>create or replace</code>, the same mistake is real: reverting Ben's change would put back the definition from before Ana's.</p>
+    </div>
+    <p>So do not hand-merge the generated files. Throw them away and generate them again on top of the new <code>master</code>. Your edit to the definition is the only thing you wrote, and git has already merged it:</p>
+<pre data-lang="shell"><span class="c"># take everything generated from master</span>
+git checkout master -- database/sqitch.plan \
+  database/revert/billing/table/invoice.sql database/verify/billing/table/invoice.sql
+git rm -q --cached database/*/migrations/2026/11/*paid_at.sql database/*/billing/table/invoice@2026-11-25_paid_at.sql
+rm database/*/migrations/2026/11/*paid_at.sql database/*/billing/table/invoice@2026-11-25_paid_at.sql
+
+<span class="c"># the merged definition is still there; ask again what it needs</span>
+<span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql
+<span class="c">-- table column billing.invoice.paid_at</span>
+alter table billing.invoice add column paid_at timestamp with time zone;
+
+<span class="p">$ </span>sqiff table database/deploy/billing/table/invoice.sql --write --tag 2026-11-25_paid_at
+…
+added migrations/2026/11/2026-11-25-100724-add-column-billing.invoice.paid_at
+reworked billing/table/invoice
+
+git add -A &amp;&amp; git rebase --continue</pre>
+    <p>The new snapshot holds Ana's <code>numeric(12,2)</code> and her index, the plan has her lines followed by Ben's, and the whole plan deploys to both a fresh database and the existing one. Regenerating takes a minute and cannot be subtly wrong in the way a hand merge can.</p>
+    <p>For a change with no rework, such as a hand-written migration or a new object, the plain resolution is enough: keep <code>master</code>'s lines, then yours, and run the checks again.</p>
+
+    <h2 id="related">When a clean merge is wrong</h2>
+    <p>The opposite happens too. One branch renames <code>customer_email</code>; another adds an index on <code>customer_email</code>. They touch different files, so git merges them without a word, and the result fails to deploy.</p>
+    <p>No layout prevents that. What prevents it is CI deploying the <em>merged</em> result before it reaches <code>master</code>: require branches to be up to date before merging, or use a merge queue, so the checks on the <a href="pipeline.html#ci">next page</a> always run against what will actually ship.</p>
+
+    <h2 id="rules">Rules worth automating</h2>
+    <ul>
+      <li><strong>The plan only grows.</strong> Compared with <code>master</code>, <code>sqitch.plan</code> has new lines at the end and no changed or removed ones.</li>
+      <li><strong>Snapshots are never edited.</strong> A new <code>@tag</code> file is fine; a modified one is a mistake.</li>
+      <li><strong>Deployed scripts are not edited in place.</strong> A change to a script that is already on <code>master</code> needs a rework.</li>
+      <li><strong>Every merge is checked as merged.</strong> Up-to-date branches or a merge queue.</li>
+    </ul>
+    <p>The first two fit in a pre-commit hook; see <a href="pipeline.html#precommit">shipping safely</a>.</p>
+
+    <div class="next">
+      <a href="functions.html">Functions and views</a>
+      <a href="pipeline.html">Next: shipping safely</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>
