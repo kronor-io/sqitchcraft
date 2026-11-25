@@ -153,8 +153,11 @@ already running keep the version they started with.
 - A callback named by an older version must keep working while machines on
   that version can reach it. Change behaviour with a new function.
 - Code sends events only through the entity's event function (for example
-  `billing.invoice_event`), which locks the owning row and refuses events
-  that do not apply. If the entity has none, write one.
+  `billing.invoice_event`), which refuses events that do not apply. If the
+  entity has none, write one.
+- Every transaction that sends events runs at `SERIALIZABLE` (never below
+  `REPEATABLE READ`) and is retried on SQLSTATE `40001`. At `READ COMMITTED`,
+  two concurrent events can leave a machine in two states at once.
 
 ## Rules
 

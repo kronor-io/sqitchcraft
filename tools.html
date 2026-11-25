@@ -204,7 +204,7 @@ sqitch deploy --client database/psql-retry.sh</pre>
       <a href="https://github.com/kronor-io/statecharts">kronor-io/statecharts</a>
     </div>
     <p>A statechart interpreter built entirely inside PostgreSQL.</p>
-    <p>Charts are rows: states, nested states, parallel regions, final states and transitions, following SCXML. Sending an event runs the transition and its <code>on_entry</code> and <code>on_exit</code> callbacks in the statement that sent it, so the state commits with your data. Every state a machine enters is logged.</p>
+    <p>Charts are rows: states, nested states, parallel regions, final states and transitions, following SCXML. Sending an event runs the transition and its <code>on_entry</code> and <code>on_exit</code> callbacks in the statement that sent it, so the state commits with your data. Every state a machine enters is logged. Send events from transactions at <code>SERIALIZABLE</code>, or at least <code>REPEATABLE READ</code>, and retry serialization failures.</p>
 <pre data-lang="sql">create extension pg_statecharts cascade;     <span class="c">-- pure SQL; needs ltree. PostgreSQL 16 to 18</span>
 
 select fsm.start_machine_with_latest_statechart(statechart_name => 'invoice_flow');

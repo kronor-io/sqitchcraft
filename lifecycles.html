@@ -51,7 +51,7 @@
   <article>
     <h1>Lifecycles</h1>
     <p class="lede">An invoice is drafted, sent, perhaps overdue, then paid or voided. Each step has rules about where it may go next and work that must happen on the way. This page shows why we let PostgreSQL run that lifecycle as a statechart, using a small example project and its real output.</p>
-    <p class="outcome">Everything below ran against PostgreSQL 18 with <a href="tools.html#statecharts">pg_statecharts</a> 0.2.0, deployed with sqitch. Long queries are wrapped, and psql's row counts are left out.</p>
+    <p class="outcome">Everything below ran against PostgreSQL 18 with <a href="tools.html#statecharts">pg_statecharts</a> 0.2.0 at <code>SERIALIZABLE</code>, deployed with sqitch. Long queries are wrapped, and psql's row counts are left out.</p>
 
     <h2 id="status">The status column</h2>
     <p>The usual model is a column and a check constraint:</p>
@@ -254,12 +254,9 @@ $$
         machine bigint;
         current_state text;
     begin
-        <span class="c">-- Lock the invoice, so two events for it are handled one after
-        -- the other, each seeing the state the previous one left.</span>
         select state_machine_id into machine
         from billing.invoice
-        where id = invoice_id
-        for update;
+        where id = invoice_id;
 
         if machine is null then
             raise exception 'invoice % does not exist', invoice_id;
@@ -279,7 +276,6 @@ $$
         <span class="c">-- …returns the states the machine is in now</span>
     end
 $$ language plpgsql;</pre>
-    <p>The <code>for update</code> matters as much as the check. <a href="#race">Two requests at once</a> shows why.</p>
 
     <h2 id="atomic">One transaction</h2>
     <p>The transition, its callbacks and everything else the caller did run in one transaction. Pay an invoice and then roll back, the way a failed payment request would:</p>
@@ -305,8 +301,15 @@ $$ language plpgsql;</pre>
     <p>The machine is back in <code>open</code>, <code>settled_at</code> is empty again, and no receipt is waiting to be sent. With a state service outside the database, this is the dual-write problem: the service says paid, the database says not, and someone writes a reconciliation job. Here the state is data in the same transaction, so there is nothing to reconcile.</p>
 
     <h2 id="race">Two requests at once</h2>
-    <p>The engine does not lock a machine while it handles an event. Two transactions that send events to the same machine at the same moment both see it in the same state. We ran exactly that: session A pays invoice 1 and holds its transaction open for two seconds, and half a second in, session B voids it.</p>
-    <p>Calling <code>fsm.notify_state_machine</code> directly from both sessions:</p>
+    <p>Statecharts needs every transaction that sends events to run at <code>REPEATABLE READ</code> or <code>SERIALIZABLE</code>; we run them all at <code>SERIALIZABLE</code>. The engine reads a machine's active states and then moves it, without a lock of its own, and the isolation level is what makes two events for one machine safe. We ran the race both ways: session A pays invoice 1 and keeps its transaction open for two seconds, and half a second in, session B voids it.</p>
+    <p>At <code>SERIALIZABLE</code>, session B waits for A, then fails, and its retry starts from what A committed:</p>
+<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');   <span class="c">-- session B</span>
+ERROR:  could not serialize access due to concurrent update
+Time: 1510.915 ms (00:01.511)
+
+<span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');   <span class="c">-- session B, retried</span>
+ERROR:  invoice 1 is paid, and invoice.void does not apply</pre>
+    <p>The invoice is paid, and only paid. At <code>READ COMMITTED</code>, PostgreSQL's default, the same two events both go through:</p>
 <pre data-lang="shell"><span class="p">=# </span>select state_id from fsm.state_machine_state
    where state_machine_id = 1 and exited_at is null;
  state_id
@@ -319,12 +322,12 @@ $$ language plpgsql;</pre>
  settled | voided
 ---------+--------
  t       | t</pre>
-    <p>The invoice is paid and voided at once, with both callbacks run. Through <code>billing.invoice_event</code>, which locks the invoice row first, session B waits for A and then sees what A did:</p>
-<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');   <span class="c">-- session B</span>
-ERROR:  invoice 1 is paid, and invoice.void does not apply
-Time: 1509.703 ms (00:01.510)</pre>
+    <p>Both sessions started from <code>open</code>, so the invoice is paid and voided at once, with both callbacks run.</p>
     <div class="callout rule">
-      <p><strong>Send every event through a function that locks the row the machine belongs to.</strong> It costs one indexed <code>select … for update</code>, it serializes events per invoice and never across invoices, and it is the difference between the two results above. Keep <code>fsm.notify_state_machine</code> itself out of application code.</p>
+      <p><strong>Send events only from <code>SERIALIZABLE</code> transactions, and retry the ones that fail with SQLSTATE <code>40001</code>.</strong> <code>REPEATABLE READ</code> is the minimum. Set it on the role the application connects as, so no code path can forget it:</p>
+<pre data-lang="sql">alter role app
+    set default_transaction_isolation = 'serializable';</pre>
+      <p>A client that already retries serialization failures needs nothing else.</p>
     </div>
 
     <h2 id="history">The history</h2>
@@ -336,11 +339,11 @@ Time: 1509.703 ms (00:01.510)</pre>
    order by entered_at, state_id;
      state_id     |   entered    |    exited
 ------------------+--------------+--------------
- draft            | 21:40:51.638 | 21:40:51.661
- awaiting_payment | 21:40:51.652 | 21:40:51.671
- open             | 21:40:51.652 | 21:40:51.678
- overdue          | 21:40:51.665 | 21:40:51.678
- paid             | 21:40:51.674 |</pre>
+ draft            | 22:02:02.040 | 22:02:02.049
+ awaiting_payment | 22:02:02.045 | 22:02:02.053
+ open             | 22:02:02.045 | 22:02:02.055
+ overdue          | 22:02:02.050 | 22:02:02.055
+ paid             | 22:02:02.054 |</pre>
     <p>Nobody wrote an audit table, and it cannot drift from the state, because it is the state: the current states are the rows with no <code>exited_at</code>. Questions that used to need an analytics pipeline are one query:</p>
 <pre data-lang="sql"><span class="c">-- How long do invoices stay overdue before they are paid?</span>
 select percentile_cont(0.5) within group (order by exited_at - entered_at)
@@ -437,7 +440,8 @@ INFO:  created new migration: statechart/invoice_flow-1.1.0
       <li class="cost">Callbacks run in the caller's transaction. Keep them short and queue anything slow.</li>
       <li class="cost">The engine has no guards. When the next state depends on data, a callback looks at the data and sends the next event.</li>
       <li class="cost">Transitions connect states with the same parent. To leave a compound state from any of its children, put the transition on the compound state, as <code>pay</code> is on <code>open</code>.</li>
-      <li class="cost">An event no state accepts is dropped, and concurrent events for one machine are not serialized. A wrapper like <code>billing.invoice_event</code> handles both; write one per entity.</li>
+      <li class="cost">Every transaction that sends events runs at <code>SERIALIZABLE</code> (at least <code>REPEATABLE READ</code>), and the application retries serialization failures.</li>
+      <li class="cost">An event no state accepts is dropped without an error. A wrapper like <code>billing.invoice_event</code> turns that into one; write one per entity.</li>
       <li class="cost">A chart version lives as long as its oldest running machine.</li>
     </ul>
     <h3>When a status column is enough</h3>
