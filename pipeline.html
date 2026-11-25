@@ -102,6 +102,7 @@ exec psql-retry</pre>
       <li><strong>sqint's static pass</strong> on staged deploy scripts.</li>
       <li><strong>The plan only grows.</strong> No line of <code>sqitch.plan</code> that exists on <code>master</code> is changed or removed.</li>
       <li><strong>Snapshots are not edited.</strong> A new <code>@tag</code> file is expected; a modified or deleted one is a mistake.</li>
+      <li><strong>pgfmt</strong> on the SQL files you stage, except rework snapshots, so every file has one format.</li>
       <li><strong>hasql-th-format --check</strong>, if you use hasql-th, so the SQL in quotes has one format.</li>
     </ul>
     <p class="filename">.pre-commit-config.yaml</p>
@@ -113,6 +114,13 @@ exec psql-retry</pre>
         entry: sqint
         language: system
         files: ^database/deploy/.*\.sql$
+
+      - id: pgfmt
+        name: pgfmt
+        entry: pgfmt
+        language: system
+        files: ^database/.*\.sql$
+        exclude: '@'     # rework snapshots keep the text that was deployed
 
       - id: plan-only-grows
         name: sqitch.plan only grows
@@ -166,7 +174,12 @@ jobs:
         with:
           fetch-depth: 0
       - uses: cachix/install-nix-action@v31
-      - run: nix profile install nixpkgs#sqitchPg github:kronor-io/sqint
+      - run: nix profile install nixpkgs#sqitchPg github:kronor-io/sqint github:kronor-io/pgfmt
+
+      - name: Check the format
+        run: |
+          git diff --name-only --diff-filter=AM "origin/$GITHUB_BASE_REF" -- database \
+            | grep '\.sql$' | grep -v @ | xargs -r pgfmt --check
 
       - name: Deploy the base branch
         run: |

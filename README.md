@@ -1,7 +1,7 @@
 # sqitchcraft
 
 The guide at https://kronor-io.github.io/sqitchcraft/: how Kronor keeps a
-PostgreSQL schema in sqitch, and how sqiff, sqint, create-migration
+PostgreSQL schema in sqitch, and how sqiff, sqint, pgfmt, create-migration
 (sqitch-with-templates), psql-retry, statecharts, hasql-check and sqitch-plan
 work together. Plain HTML, one stylesheet, Google Fonts; no build step. GitHub
 Pages serves the main branch as it is.
@@ -15,7 +15,7 @@ SQL are highlighted as SQL.
 Preview it locally:
 
 ```bash
-python3 -m http.server 8765 --directory site
+python3 -m http.server 8765
 ```
 
 Reading order:

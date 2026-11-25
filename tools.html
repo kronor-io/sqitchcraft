@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tools · sqitchcraft</title>
-<meta name="description" content="Reference for create-migration, sqiff, sqint, psql-retry, statecharts, hasql-check and sqitch-plan: what each does, how to install it, and its main commands.">
+<meta name="description" content="Reference for create-migration, sqiff, sqint, pgfmt, psql-retry, statecharts, hasql-check and sqitch-plan: what each does, how to install it, and its main commands.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
@@ -36,6 +36,7 @@
       <li><a href="#create-migration">create-migration</a></li>
       <li><a href="#sqiff">sqiff</a></li>
       <li><a href="#sqint">sqint</a></li>
+      <li><a href="#pgfmt">pgfmt</a></li>
       <li><a href="#psql-retry">psql-retry</a></li>
       <li><a href="#statecharts">statecharts</a></li>
       <li><a href="#hasql-check">hasql-check</a></li>
@@ -53,6 +54,7 @@
         <tr><td>Change a table by editing its file</td><td><a href="#sqiff">sqiff</a></td></tr>
         <tr><td>Start a new object, or a change that takes several releases</td><td><a href="#create-migration">create-migration</a>, from the sqitch-with-templates repository</td></tr>
         <tr><td>Catch lock and rewrite hazards before review</td><td><a href="#sqint">sqint</a></td></tr>
+        <tr><td>Keep SQL files in one format, without changing what they do</td><td><a href="#pgfmt">pgfmt</a></td></tr>
         <tr><td>Deploy to a busy database without queueing traffic</td><td><a href="#psql-retry">psql-retry</a></td></tr>
         <tr><td>Check a Haskell service's queries against the schema</td><td><a href="#hasql-check">hasql-check</a></td></tr>
         <tr><td>Enforce a lifecycle in the database</td><td><a href="#statecharts">statecharts</a>, installed as the <code>pg_statecharts</code> extension</td></tr>
@@ -138,6 +140,50 @@ sqint $(git diff --name-only main -- database/deploy)</pre>
     </table>
     </div>
     <p>BLOCK exits 1. There is no configuration file: silence one statement with <code>-- lint:ignore reason="…"</code>, and the reason is required.</p>
+
+    <!-- pgfmt -->
+    <div class="tool-head" id="pgfmt">
+      <h2>pgfmt</h2>
+      <a href="https://github.com/kronor-io/pgfmt">kronor-io/pgfmt</a>
+    </div>
+    <p>Formats PostgreSQL files without changing what any statement does.</p>
+    <p>It reads each file with PostgreSQL's own parser, lays out each statement, and parses the result again: a statement is rewritten only if PostgreSQL sees the same statement afterwards. Comments and blank lines between statements stay byte for byte, and the SQL statements inside PL/pgSQL bodies are formatted too.</p>
+<pre data-lang="shell">nix run github:kronor-io/pgfmt -- --help
+<span class="c"># the SQL files this branch adds or changes, without rework snapshots</span>
+changed=$(git diff --name-only --diff-filter=AM master -- 'database/*.sql' | grep -v @)
+pgfmt $changed            <span class="c"># rewrite them</span>
+pgfmt --check $changed    <span class="c"># or only report them, for CI</span></pre>
+    <p>On the example project's invoice table, with the defaults:</p>
+<pre data-lang="sql"><span class="c">-- database/deploy/billing/table/invoice.sql</span>
+<span class="del">-BEGIN;</span>
+<span class="add">+begin;</span>
+     create table if not exists billing.invoice (
+         id bigint generated always as identity primary key,
+         customer_email text not null,
+<span class="del">-        amount numeric(12,2) not null,</span>
+<span class="add">+        amount numeric(12, 2) not null,</span>
+         …
+<span class="del">-    comment on table billing.invoice is</span>
+<span class="del">-      'An invoice sent to a customer.';</span>
+<span class="add">+    comment on table billing.invoice is 'An invoice sent to a customer.';</span>
+         …
+     create index if not exists invoice_customer_email
+<span class="del">-        on billing.invoice (customer_email);</span>
+<span class="add">+    on billing.invoice using btree (customer_email);</span></pre>
+    <p>DDL is laid out by libpg_query, which spells a few things its own way: <code>using btree</code> is written out, <code>integer</code> can become <code>int</code>, and <code>set lock_timeout to '50ms'</code> comes out as <code>to "50ms"</code>. Each one parses to the same statement, which is what pgfmt checks. The formatted example project deploys, verifies, reverts and deploys again exactly as before.</p>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Option</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>pgfmt FILE…</code></td><td>Rewrites the files in place; with no files, reads stdin and writes stdout, for editors.</td></tr>
+        <tr><td><code>--check</code></td><td>Changes nothing, names the files that are not formatted, and exits 1.</td></tr>
+        <tr><td><code>--keyword-case lower|upper</code></td><td>How keywords are spelled. Identifiers are never changed.</td></tr>
+        <tr><td><code>--backend auto|syntax|libpg-query</code></td><td>Who lays statements out: pgfmt's renderer (leading commas, DML) or libpg_query's (trailing commas, anything, and all DDL).</td></tr>
+        <tr><td><code>-v</code></td><td>Says which statements were left as written, and why.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Format what your branch adds or changes, and leave the rest alone. A migration that is already on <code>master</code> has been deployed as written, and a <code>@tag</code> snapshot is that same deployed text, so keep both out of the file list, as the commands above do with <code>grep -v @</code>. Exit code 2 means a file is not valid SQL, or a statement failed the check and was kept as it was.</p>
 
     <!-- psql-retry -->
     <div class="tool-head" id="psql-retry">

@@ -91,6 +91,7 @@
     <p>An agent is only as careful as the check it runs at the end. <code>scripts/check-database</code> puts the important checks behind one command, so the instructions can say "run this" rather than describe a procedure:</p>
 <pre data-lang="shell"><span class="p">$ </span>scripts/check-database
 == sqint: deploy scripts changed since master
+== pgfmt: SQL files changed since master
 == the plan only grows
 == snapshots are not edited
 == fresh database: deploy the whole plan
@@ -102,7 +103,7 @@ Deploying changes to db:pg:check_database_scratch
   - migrations/2026/11/2026-11-25-105014-add-column-billing.invoice.note .. ok
   + migrations/2026/11/2026-11-25-105014-add-column-billing.invoice.note .. ok
 == database checks passed</pre>
-    <p>It reverts the branch's changes by counting them back from the end of the plan (<code>sqitch rebase --onto @HEAD^2</code>), not by name, because a reworked change's name is ambiguous. It deliberately does not use sqint's dynamic pass, which has <a href="pipeline.html#ci">known limits with reworks</a>. Run it in CI too, so the agent's check and the merge check are the same.</p>
+    <p>It reverts the branch's changes by counting them back from the end of the plan (<code>sqitch rebase --onto @HEAD^2</code>), not by name, because a reworked change's name is ambiguous. It leaves out sqint's dynamic pass, which needs the base branch deployed first; <a href="pipeline.html#ci">CI runs that</a>. Run it in CI too, so the agent's check and the merge check are the same.</p>
 
     <h2 id="guardrails">Guardrails outside the file</h2>
     <p>Instructions are followed most of the time. For the things that must never happen, do not rely on them alone.</p>

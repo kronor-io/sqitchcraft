@@ -160,6 +160,8 @@ Always:
 - start new objects and hand-written migrations from create-migration;
 - keep definitions safe to run twice (`if not exists`, `or replace`,
   `drop … if exists` for an old signature);
+- if the project uses pgfmt, run it on the SQL files you add or change, but
+  never on a `@tag` snapshot or a migration that is already on the main branch;
 - keep every change backwards compatible with the code that is running while
   it deploys: add first, remove in a later release.
 
@@ -185,7 +187,7 @@ the wrong version.
 Run all of these, and report each one's result:
 
 ```bash
-scripts/check-database                 # lint, plan rules, fresh deploy, revert and redeploy
+scripts/check-database                 # lint, format, plan rules, fresh deploy, revert and redeploy
 ```
 
 - `sqint` findings: fix every `BLOCK`. Do not add `-- lint:ignore` yourself.
