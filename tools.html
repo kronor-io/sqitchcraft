@@ -171,7 +171,7 @@ pgfmt --check $changed    <span class="c"># or only report them, for CI</span></
      create index if not exists invoice_customer_email
 <span class="del">-        on billing.invoice (customer_email);</span>
 <span class="add">+    on billing.invoice using btree (customer_email);</span></pre>
-    <p>DDL is laid out by libpg_query, which spells a few things its own way: <code>using btree</code> is written out, <code>integer</code> can become <code>int</code>, and <code>set lock_timeout to '50ms'</code> comes out as <code>to "50ms"</code>. Each one parses to the same statement, which is what pgfmt checks. The formatted example project deploys, verifies, reverts and deploys again exactly as before.</p>
+    <p>DDL is laid out by libpg_query, which spells a few things its own way: <code>using btree</code> is written out, and <code>integer</code> can become <code>int</code>. Each one parses to the same statement, which is what pgfmt checks. A <code>set</code> value keeps its single quotes: <code>set lock_timeout to '50ms'</code> stays as it is. The formatted example project deploys, verifies, reverts and deploys again exactly as before.</p>
     <div class="table-wrap">
     <table class="plain">
       <thead><tr><th>Option</th><th>Does</th></tr></thead>
