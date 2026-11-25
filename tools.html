@@ -23,6 +23,7 @@
       <a href="git.html">Git and review</a>
       <a href="pipeline.html">Shipping safely</a>
       <a href="architecture.html">Database design</a>
+      <a href="lifecycles.html">Lifecycles</a>
       <a href="agents.html">For agents</a>
       <a href="tools.html" aria-current="page">Tools</a>
     </nav>
@@ -211,6 +212,7 @@ select fsm.notify_state_machine(machine_id => 42, event_name => 'invoice.pay',
                                 data => '{"amount": "120.00"}');
 select fsm.is_state_active(machine_id => 42, state_id => 'paid');</pre>
     <p>Install it with PGXN (<code>pgxn install pg_statecharts</code>), a Debian package, or <code>make install</code>. On development machines, <code>pg_statecharts_dev</code> turns <code>.scxml</code> files into sqitch changes with <code>fsm.gen_statechart_sqitch_migrations</code>; never create it in production. A Haskell SDK generates state and event types from a chart. Projects that deployed the engine as a sqitch project can move to the extension with <code>create extension pg_statecharts version 'sqitch'</code>.</p>
+    <p><a href="lifecycles.html">Lifecycles</a> works through a real invoice chart: callbacks, the wrapper function that every event should go through, and what happens when two requests race.</p>
 
     <!-- hasql-check -->
     <div class="tool-head" id="hasql-check">

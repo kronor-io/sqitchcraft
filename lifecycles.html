@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lifecycles · sqitchcraft</title>
+<meta name="description" content="Why Kronor lets PostgreSQL run an invoice's lifecycle as a statechart: the bugs a status column invites, a chart with callbacks, and real output showing refused events, atomic transitions, a race and the history it keeps.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="lifecycles.html" aria-current="page">Lifecycles</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>
+      <li><a href="#status">The status column</a></li>
+      <li><a href="#chart">The lifecycle as a chart</a></li>
+      <li><a href="#callbacks">What each state does</a></li>
+      <li><a href="#run">One invoice, start to finish</a></li>
+      <li><a href="#refused">Events that do not apply</a></li>
+      <li><a href="#atomic">One transaction</a></li>
+      <li><a href="#race">Two requests at once</a></li>
+      <li><a href="#history">The history</a></li>
+      <li><a href="#repo">In the repository</a></li>
+      <li><a href="#versions">Changing the chart</a></li>
+      <li><a href="#cost">What it costs</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>Lifecycles</h1>
+    <p class="lede">An invoice is drafted, sent, perhaps overdue, then paid or voided. Each step has rules about where it may go next and work that must happen on the way. This page shows why we let PostgreSQL run that lifecycle as a statechart, using a small example project and its real output.</p>
+    <p class="outcome">Everything below ran against PostgreSQL 18 with <a href="tools.html#statecharts">pg_statecharts</a> 0.2.0, deployed with sqitch. Long queries are wrapped, and psql's row counts are left out.</p>
+
+    <h2 id="status">The status column</h2>
+    <p>The usual model is a column and a check constraint:</p>
+<pre data-lang="sql">status text not null default 'draft'
+    check (status in ('draft', 'sent', 'overdue', 'paid', 'voided'))</pre>
+    <p>The constraint knows which values exist. It does not know which moves are allowed, so every writer has to. The checkout service marks an invoice paid, the back office voids one, a nightly job marks the late ones overdue, a worker sends reminders. Each of them carries its own copy of the rules, and the bugs are in the gaps between the copies:</p>
+    <ul class="verdicts">
+      <li class="no"><strong>A voided invoice gets paid.</strong> <code>'paid'</code> is a valid value, and the payment handler that forgot to check the old status writes it.</li>
+      <li class="no"><strong>A reminder goes out after the payment.</strong> The reminder was queued when the invoice went overdue. The payment handler did not know it had to cancel it; the void handler did, because someone hit the bug there first.</li>
+      <li class="no"><strong>Payment and void race.</strong> Both requests read <code>sent</code> and both write, unless every update repeats <code>where status = 'sent'</code> and every caller checks the row count.</li>
+      <li class="no"><strong>Nobody knows when.</strong> Each update overwrites the last. How long was this invoice overdue? Only if someone also wrote an audit table, and kept it in sync.</li>
+    </ul>
+    <p>None of these is hard to fix once. The trouble is that the rules have no home, so they are fixed once per writer.</p>
+
+    <h2 id="chart">The lifecycle as a chart</h2>
+    <p>A statechart gives the rules a home. It is a state machine with nesting: a state can contain states, and a transition on the outer state applies whichever inner state the machine is in. Here is the invoice:</p>
+<figure class="chart">
+<svg viewBox="0 0 750 236" role="img" aria-labelledby="chart-title">
+  <title id="chart-title">invoice_flow: draft goes to open on issue. Open contains awaiting_payment, which goes to overdue when the due date passes. Open goes to paid on pay and to voided on void. Draft can also be voided.</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--ink-soft)"/>
+    </marker>
+  </defs>
+  <g font-family="var(--font-code)" font-size="13" fill="var(--ink)">
+    <!-- open, the compound state -->
+    <rect x="150" y="24" width="400" height="132" rx="14" fill="var(--sheet)" stroke="var(--ink)" stroke-width="1.5"/>
+    <text x="166" y="46" font-weight="600">open</text>
+    <!-- states -->
+    <rect x="12" y="74" width="92" height="40" rx="8" fill="var(--sheet)" stroke="var(--ink)" stroke-width="1.5"/>
+    <text x="58" y="99" text-anchor="middle">draft</text>
+    <rect x="164" y="74" width="172" height="40" rx="8" fill="var(--code-bg)" stroke="var(--ink-soft)"/>
+    <text x="250" y="99" text-anchor="middle">awaiting_payment</text>
+    <rect x="426" y="74" width="104" height="40" rx="8" fill="var(--code-bg)" stroke="var(--ink-soft)"/>
+    <text x="478" y="99" text-anchor="middle">overdue</text>
+    <rect x="630" y="74" width="108" height="40" rx="8" fill="var(--sheet)" stroke="var(--ok)" stroke-width="3"/>
+    <text x="684" y="99" text-anchor="middle">paid</text>
+    <rect x="630" y="178" width="108" height="40" rx="8" fill="var(--sheet)" stroke="var(--block)" stroke-width="3"/>
+    <text x="684" y="203" text-anchor="middle">voided</text>
+  </g>
+  <g fill="none" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#arrow)">
+    <path d="M104,94 H148"/>
+    <path d="M336,94 H424"/>
+    <path d="M550,94 H628"/>
+    <path d="M350,156 V190 H628"/>
+    <path d="M58,114 V208 H628"/>
+  </g>
+  <g font-family="var(--font-code)" font-size="11.5" fill="var(--ink-soft)">
+    <text x="126" y="86" text-anchor="middle">issue</text>
+    <text x="380" y="66" text-anchor="middle">due_date_passed</text>
+    <text x="589" y="86" text-anchor="middle">pay</text>
+    <text x="490" y="184" text-anchor="middle">void</text>
+    <text x="300" y="202" text-anchor="middle">void</text>
+  </g>
+</svg>
+<figcaption>Thick borders are final states. <code>pay</code> and <code>void</code> leave <code>open</code> from whichever state inside it is active.</figcaption>
+</figure>
+    <p class="filename">database/statecharts/invoice_flow-1.0.scxml</p>
+<pre data-lang="xml">&lt;scxml xmlns="http://www.w3.org/2005/07/scxml"
+       name="invoice_flow" version="1.0.0" initial="draft"&gt;
+
+  &lt;state id="draft"&gt;
+    &lt;transition event="invoice.issue" target="open"/&gt;
+    &lt;transition event="invoice.void"  target="voided"/&gt;
+  &lt;/state&gt;
+
+  &lt;!-- Sent and not yet paid. pay and void are defined once, here, and work
+       from every state inside open. --&gt;
+  &lt;state id="open"&gt;
+    &lt;initial&gt;&lt;transition target="awaiting_payment"/&gt;&lt;/initial&gt;
+    &lt;onentry&gt;&lt;script src="billing.send_invoice"/&gt;&lt;/onentry&gt;
+    &lt;onexit&gt;&lt;script src="billing.cancel_reminders"/&gt;&lt;/onexit&gt;
+    &lt;transition event="invoice.pay"  target="paid"/&gt;
+    &lt;transition event="invoice.void" target="voided"/&gt;
+
+    &lt;state id="awaiting_payment"&gt;
+      &lt;transition event="invoice.due_date_passed" target="overdue"/&gt;
+    &lt;/state&gt;
+    &lt;state id="overdue"&gt;
+      &lt;onentry&gt;&lt;script src="billing.queue_reminder"/&gt;&lt;/onentry&gt;
+    &lt;/state&gt;
+  &lt;/state&gt;
+
+  &lt;final id="paid"&gt;
+    &lt;onentry&gt;&lt;script src="billing.settle_invoice"/&gt;&lt;/onentry&gt;
+  &lt;/final&gt;
+  &lt;final id="voided"&gt;
+    &lt;onentry&gt;&lt;script src="billing.void_invoice"/&gt;&lt;/onentry&gt;
+  &lt;/final&gt;
+&lt;/scxml&gt;</pre>
+    <p>Read it as the answer to the four bugs. There is no transition out of <code>voided</code> or <code>paid</code>, so nothing pays a voided invoice. Leaving <code>open</code> cancels reminders, whichever event leaves it. <code>pay</code> is written once, on <code>open</code>, so adding a state inside <code>open</code> later (say, <code>disputed</code>) needs no new payment transition. The format is <a href="https://www.w3.org/TR/scxml/">W3C SCXML</a>, so the chart can be drawn by tools that are not ours.</p>
+
+    <h2 id="callbacks">What each state does</h2>
+    <p>The <code>onentry</code> and <code>onexit</code> scripts are ordinary PostgreSQL functions. Each one takes an <code>fsm_event_payload</code> (the machine, the event and its data, the states it moves from and to) and finds its invoice by the machine's id:</p>
+    <p class="filename">database/deploy/billing/function/invoice_callbacks.sql</p>
+<pre data-lang="sql"><span class="c">-- on_entry of open: the invoice goes out.</span>
+create or replace function billing.send_invoice(event_payload fsm_event_payload)
+    returns void as
+$$
+    with issued as (
+        update billing.invoice
+        set issued_at = now()
+        where state_machine_id = (event_payload).machine_id
+        returning id
+    )
+    insert into billing.outbox (invoice_id, kind)
+    select id, 'invoice' from issued;
+$$ language sql;
+
+<span class="c">-- on_exit of open, however it is left: a reminder that has not gone out
+-- yet must not go out now.</span>
+create or replace function billing.cancel_reminders(event_payload fsm_event_payload)
+    returns void as
+$$
+    update billing.outbox o
+    set cancelled_at = now()
+    from billing.invoice i
+    where i.state_machine_id = (event_payload).machine_id
+      and o.invoice_id = i.id
+      and o.kind = 'reminder'
+      and o.sent_at is null
+      and o.cancelled_at is null;
+$$ language sql;
+
+<span class="c">-- queue_reminder, settle_invoice and void_invoice follow the same pattern.</span></pre>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>State</th><th>On entry</th><th>On exit</th></tr></thead>
+      <tbody>
+        <tr><td><code>open</code></td><td>set <code>issued_at</code>, queue the invoice email</td><td>cancel unsent reminders</td></tr>
+        <tr><td><code>overdue</code></td><td>queue a reminder</td><td></td></tr>
+        <tr><td><code>paid</code></td><td>set <code>settled_at</code>, queue a receipt</td><td></td></tr>
+        <tr><td><code>voided</code></td><td>set <code>voided_at</code></td><td></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Two habits keep callbacks cheap and queries plain:</p>
+    <ul>
+      <li><strong>Write columns that queries read.</strong> <code>settled_at</code> is on the invoice, so a report filters on a column and never joins the state log.</li>
+      <li><strong>Queue slow work.</strong> A callback runs inside the transaction that sent the event. It writes to <code>billing.outbox</code>, and a worker sends the email after that transaction commits. An HTTP call from inside a callback would hold the invoice's locks for the length of a network round trip, and could not be taken back if the transaction then rolled back.</li>
+    </ul>
+    <p><code>create-migration function statechart</code> writes a callback's skeleton with the payload already unpacked.</p>
+
+    <h2 id="run">One invoice, start to finish</h2>
+    <p>Inserting an invoice creates its machine and starts it in <code>draft</code> (two triggers, <a href="#repo">below</a>). From then on, the application changes the invoice's state only by sending events, through one function, <code>billing.invoice_event</code>, which returns the states the machine is in afterwards:</p>
+<pre data-lang="shell"><span class="p">=# </span>insert into billing.invoice (customer_email, amount, due_on)
+   values ('ana@example.com', 120.00, current_date + 14)
+   returning id, state_machine_id;
+ id | state_machine_id
+----+------------------
+  1 |                1
+
+<span class="p">=# </span>select billing.invoice_event(1, 'invoice.issue');
+     invoice_event
+-----------------------
+ awaiting_payment/open
+
+<span class="p">=# </span>select billing.invoice_event(1, 'invoice.due_date_passed');
+ invoice_event
+---------------
+ open/overdue
+
+<span class="p">=# </span>select kind, sent_at, cancelled_at
+   from billing.outbox where invoice_id = 1 order by id;
+   kind   | sent_at | cancelled_at
+----------+---------+--------------
+ invoice  |         |
+ reminder |         |</pre>
+    <p>Entering <code>open</code> queued the invoice email; entering <code>overdue</code> queued a reminder, which the worker has not sent yet. Now the customer pays:</p>
+<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.pay');
+ invoice_event
+---------------
+ paid
+
+<span class="p">=# </span>select kind, sent_at, cancelled_at is not null as cancelled
+   from billing.outbox where invoice_id = 1 order by id;
+   kind   | sent_at | cancelled
+----------+---------+-----------
+ invoice  |         | f
+ reminder |         | t
+ receipt  |         | f
+
+<span class="p">=# </span>select issued_at is not null as issued, settled_at is not null as settled
+   from billing.invoice where id = 1;
+ issued | settled
+--------+---------
+ t      | t</pre>
+    <p><code>pay</code> was defined on <code>open</code> and worked from <code>overdue</code>. Leaving <code>open</code> cancelled the reminder, so the customer gets a receipt and not a reminder for an invoice they just paid. No payment code had to know reminders exist.</p>
+
+    <h2 id="refused">Events that do not apply</h2>
+    <p>The same invoice, now paid, cannot be voided:</p>
+<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');
+ERROR:  invoice 1 is paid, and invoice.void does not apply</pre>
+    <p>That error comes from the wrapper, not the engine. Left to itself, <code>fsm.notify_state_machine</code> drops an event that no active state accepts, and returns as if nothing happened. That suits events that only sometimes matter, and hides mistakes for events that always should. So the application calls one function per entity, which asks <code>fsm.is_valid_transition</code> first and refuses loudly:</p>
+    <p class="filename">database/deploy/billing/function/invoice_event.sql</p>
+<pre data-lang="sql">create or replace function billing.invoice_event(invoice_id bigint, event text)
+    returns text as
+$$
+    declare
+        machine bigint;
+        current_state text;
+    begin
+        <span class="c">-- Lock the invoice, so two events for it are handled one after
+        -- the other, each seeing the state the previous one left.</span>
+        select state_machine_id into machine
+        from billing.invoice
+        where id = invoice_id
+        for update;
+
+        if machine is null then
+            raise exception 'invoice % does not exist', invoice_id;
+        end if;
+
+        select string_agg(state_id, '/' order by entered_at) into current_state
+        from fsm.state_machine_state
+        where state_machine_id = machine and exited_at is null;
+
+        if not fsm.is_valid_transition(machine_id =&gt; machine, event_name =&gt; event) then
+            raise exception 'invoice % is %, and % does not apply', invoice_id, current_state, event
+                using errcode = 'check_violation';
+        end if;
+
+        perform fsm.notify_state_machine(machine_id =&gt; machine, event_name =&gt; event);
+
+        <span class="c">-- …returns the states the machine is in now</span>
+    end
+$$ language plpgsql;</pre>
+    <p>The <code>for update</code> matters as much as the check. <a href="#race">Two requests at once</a> shows why.</p>
+
+    <h2 id="atomic">One transaction</h2>
+    <p>The transition, its callbacks and everything else the caller did run in one transaction. Pay an invoice and then roll back, the way a failed payment request would:</p>
+<pre data-lang="shell"><span class="p">=# </span>begin;
+<span class="p">=# </span>select billing.invoice_event(2, 'invoice.pay');
+ invoice_event
+---------------
+ paid
+
+<span class="p">=# </span>select settled_at is not null as settled from billing.invoice where id = 2;
+ settled
+---------
+ t
+
+<span class="p">=# </span>rollback;
+<span class="p">=# </span>select fsm.is_state_active(machine_id =&gt; state_machine_id, state_id =&gt; 'open') as open,
+          settled_at is not null as settled,
+          (select count(*) from billing.outbox o where o.invoice_id = 2 and kind = 'receipt') as receipts
+   from billing.invoice where id = 2;
+ open | settled | receipts
+------+---------+----------
+ t    | f       |        0</pre>
+    <p>The machine is back in <code>open</code>, <code>settled_at</code> is empty again, and no receipt is waiting to be sent. With a state service outside the database, this is the dual-write problem: the service says paid, the database says not, and someone writes a reconciliation job. Here the state is data in the same transaction, so there is nothing to reconcile.</p>
+
+    <h2 id="race">Two requests at once</h2>
+    <p>The engine does not lock a machine while it handles an event. Two transactions that send events to the same machine at the same moment both see it in the same state. We ran exactly that: session A pays invoice 1 and holds its transaction open for two seconds, and half a second in, session B voids it.</p>
+    <p>Calling <code>fsm.notify_state_machine</code> directly from both sessions:</p>
+<pre data-lang="shell"><span class="p">=# </span>select state_id from fsm.state_machine_state
+   where state_machine_id = 1 and exited_at is null;
+ state_id
+----------
+ paid
+ voided
+
+<span class="p">=# </span>select settled_at is not null as settled, voided_at is not null as voided
+   from billing.invoice where id = 1;
+ settled | voided
+---------+--------
+ t       | t</pre>
+    <p>The invoice is paid and voided at once, with both callbacks run. Through <code>billing.invoice_event</code>, which locks the invoice row first, session B waits for A and then sees what A did:</p>
+<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');   <span class="c">-- session B</span>
+ERROR:  invoice 1 is paid, and invoice.void does not apply
+Time: 1509.703 ms (00:01.510)</pre>
+    <div class="callout rule">
+      <p><strong>Send every event through a function that locks the row the machine belongs to.</strong> It costs one indexed <code>select … for update</code>, it serializes events per invoice and never across invoices, and it is the difference between the two results above. Keep <code>fsm.notify_state_machine</code> itself out of application code.</p>
+    </div>
+
+    <h2 id="history">The history</h2>
+    <p>Every state a machine enters is a row in <code>fsm.state_machine_state</code>, closed when it is left. Invoice 1's life:</p>
+<pre data-lang="shell"><span class="p">=# </span>select state_id, to_char(entered_at, 'HH24:MI:SS.MS') as entered,
+                    to_char(exited_at, 'HH24:MI:SS.MS') as exited
+   from fsm.state_machine_state
+   where state_machine_id = (select state_machine_id from billing.invoice where id = 1)
+   order by entered_at, state_id;
+     state_id     |   entered    |    exited
+------------------+--------------+--------------
+ draft            | 21:40:51.638 | 21:40:51.661
+ awaiting_payment | 21:40:51.652 | 21:40:51.671
+ open             | 21:40:51.652 | 21:40:51.678
+ overdue          | 21:40:51.665 | 21:40:51.678
+ paid             | 21:40:51.674 |</pre>
+    <p>Nobody wrote an audit table, and it cannot drift from the state, because it is the state: the current states are the rows with no <code>exited_at</code>. Questions that used to need an analytics pipeline are one query:</p>
+<pre data-lang="sql"><span class="c">-- How long do invoices stay overdue before they are paid?</span>
+select percentile_cont(0.5) within group (order by exited_at - entered_at)
+from fsm.state_machine_state o
+join fsm.state_machine_state p
+  on p.state_machine_id = o.state_machine_id and p.state_id = 'paid'
+where o.state_id = 'overdue';</pre>
+
+    <h2 id="repo">In the repository</h2>
+    <p>The chart is a file next to the definitions, and it reaches the database as an ordinary sqitch change:</p>
+<pre data-lang="tree">database/
+├── statecharts/
+│   └── invoice_flow-1.0.scxml                 <span class="c"># the chart you edit</span>
+├── deploy/
+│   ├── billing/
+│   │   ├── table/invoice.sql                  <span class="c"># state_machine_id bigint not null unique</span>
+│   │   └── function/
+│   │       ├── invoice_callbacks.sql          <span class="c"># what each state does</span>
+│   │       └── invoice_event.sql              <span class="c"># the wrapper, and the two triggers</span>
+│   └── statechart/
+│       └── invoice_flow-1.0.0.sql             <span class="c"># generated from the .scxml</span>
+└── sqitch.plan</pre>
+    <p>On a development database, the <code>pg_statecharts_dev</code> extension turns the SCXML into that change and appends it to the plan. It reads and writes files on the database server, so it belongs on development machines only:</p>
+<pre data-lang="shell"><span class="p">$ </span>psql -c "create extension if not exists pg_statecharts_dev cascade" \
+       -c "select fsm.gen_statechart_sqitch_migrations(
+             source_path           =&gt; '$PWD/database/statecharts',
+             sqitch_plan_file_path =&gt; '$PWD/database/sqitch.plan')"
+INFO:  created new migration: statechart/invoice_flow-1.0.0</pre>
+    <p class="filename">database/deploy/statechart/invoice_flow-1.0.0.sql (generated, abridged)</p>
+<pre data-lang="sql">insert into fsm.statechart (name, version) values ('invoice_flow', fsm.to_semver('1.0.0')) returning id into chart;
+insert into fsm.state (statechart_id, id, name, parent_id, is_initial, is_final, on_entry, on_exit) values
+(chart, 'draft', '', null, true, false, array[]::fsm_callback_name[], array[]::fsm_callback_name[]),
+(chart, 'open', '', null, false, false, array[('billing', 'send_invoice')]::fsm_callback_name[], array[('billing', 'cancel_reminders')]::fsm_callback_name[]),
+(chart, 'awaiting_payment', '', 'open', true, false, …),
+…
+insert into fsm.transition (statechart_id, event, source_state, target_state) values
+(chart, 'invoice.issue', 'draft', 'open'),
+(chart, 'invoice.void', 'draft', 'voided'),
+(chart, 'invoice.pay', 'open', 'paid'),
+(chart, 'invoice.void', 'open', 'voided'),
+(chart, 'invoice.due_date_passed', 'awaiting_payment', 'overdue');</pre>
+    <p>Its verify script checks that every callback the chart names exists, so the callbacks' change comes first in the plan. The plan for the example:</p>
+<pre data-lang="plan">extension/pg_statecharts
+billing/schema
+billing/table/invoice [billing/schema]
+billing/function/invoice_callbacks [billing/table/invoice]
+statechart/invoice_flow-1.0.0
+billing/function/invoice_event [statechart/invoice_flow-1.0.0]</pre>
+    <p>Each invoice gets its machine from two triggers: a <code>before insert</code> one fills <code>state_machine_id</code> with <code>fsm.create_state_machine_with_latest_statechart(statechart_name =&gt; 'invoice_flow')</code>, and an <code>after insert</code> one calls <code>fsm.start_machine</code>, which enters <code>draft</code> and runs its callbacks once the row exists. The whole project deploys, verifies, reverts and deploys again with sqitch.</p>
+
+    <h2 id="versions">Changing the chart</h2>
+    <p>A machine runs the chart version it was created with. To change the lifecycle, copy the SCXML to a new version, edit it, and generate again; that adds <code>statechart/invoice_flow-1.1.0</code> to the plan. Invoices created after the deploy get 1.1; invoices already open stay on 1.0 until they finish. The generated change is never edited and never reworked: a new version is a new change, the way a migration is.</p>
+    <p>We added a <code>disputed</code> state inside <code>open</code> as version 1.1, with no other change:</p>
+<pre data-lang="shell"><span class="p">$ </span>psql -c "select fsm.gen_statechart_sqitch_migrations(…)"
+INFO:  updated existing migration: statechart/invoice_flow-1.0.0
+INFO:  created new migration: statechart/invoice_flow-1.1.0
+<span class="p">$ </span>git status --short
+ M database/sqitch.plan
+?? database/deploy/statechart/invoice_flow-1.1.0.sql
+?? database/revert/statechart/invoice_flow-1.1.0.sql
+?? database/statecharts/invoice_flow-1.1.scxml
+?? database/verify/statechart/invoice_flow-1.1.0.sql
+<span class="p">$ </span>sqitch deploy
+  + statechart/invoice_flow-1.1.0 .. ok
+
+<span class="p">=# </span>select i.id, fsm.semver_text(c.version) as chart
+   from billing.invoice i
+   join fsm.state_machine m on m.id = i.state_machine_id
+   join fsm.statechart c on c.id = m.statechart_id;
+ id | chart
+----+-------
+  1 | 1.0.0
+  2 | 1.1.0
+
+<span class="p">=# </span>select billing.invoice_event(2, 'invoice.issue');
+ awaiting_payment/open
+<span class="p">=# </span>select billing.invoice_event(2, 'invoice.dispute');
+ open/disputed
+<span class="p">=# </span>select billing.invoice_event(2, 'invoice.pay');
+ paid</pre>
+    <p>The 1.0 change was regenerated byte for byte, so git shows it unchanged. Invoice 1 keeps the chart it started with. Invoice 2, created after the deploy, can be disputed, and <code>pay</code> works from <code>disputed</code> without a new transition, because it is defined on <code>open</code>.</p>
+    <p>Two consequences to plan for:</p>
+    <ul>
+      <li><strong>Callbacks serve every live version.</strong> A callback named by 1.0 must keep working while any 1.0 machine can still enter that state. Change its behaviour with a new function named by the new chart, not by editing the old one.</li>
+      <li><strong>Moving running machines is a data migration.</strong> If open invoices must move to 1.1, write that as a migration, like any backfill.</li>
+    </ul>
+
+    <h2 id="cost">What it costs</h2>
+    <ul class="verdicts">
+      <li class="yes">The rules live in one file that a reviewer can read, and the database refuses moves the file does not allow.</li>
+      <li class="yes">Work that belongs to a state happens on entry or exit, whichever code path got there.</li>
+      <li class="yes">The state commits with the data, or not at all. Every service that can send SQL uses the same machine.</li>
+      <li class="yes">The history is kept, and it is the same rows as the state.</li>
+      <li class="cost">Callbacks run in the caller's transaction. Keep them short and queue anything slow.</li>
+      <li class="cost">The engine has no guards. When the next state depends on data, a callback looks at the data and sends the next event.</li>
+      <li class="cost">Transitions connect states with the same parent. To leave a compound state from any of its children, put the transition on the compound state, as <code>pay</code> is on <code>open</code>.</li>
+      <li class="cost">An event no state accepts is dropped, and concurrent events for one machine are not serialized. A wrapper like <code>billing.invoice_event</code> handles both; write one per entity.</li>
+      <li class="cost">A chart version lives as long as its oldest running machine.</li>
+    </ul>
+    <h3>When a status column is enough</h3>
+    <p>A flag that only ever goes from false to true does not need a chart, and neither does a status that nothing reacts to. Statecharts pay for themselves when a lifecycle has moves worth refusing, work attached to its steps, and a history someone will ask about: payments, refunds, orders, onboarding. Start with the entity whose invalid transitions have already cost you an incident.</p>
+
+    <div class="next">
+      <a href="architecture.html">Database design</a>
+      <a href="agents.html">Next: instructions for agents</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>

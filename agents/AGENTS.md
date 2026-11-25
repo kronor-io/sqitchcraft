@@ -42,6 +42,7 @@ reconstruct it from migrations.
 | Rename a column used by running code | `create-migration rename-column-step-1`, later `rename-column-step-2` |
 | Add an index to a big table | `create-migration add-index` (or let sqiff write it from the definition) |
 | Backfill data | `create-migration bulk-update` |
+| Change a lifecycle (statechart) | Copy `database/statecharts/<name>-<version>.scxml` to a new version, edit it, regenerate with `pg_statecharts_dev` (see below) |
 | Anything else that alters data or schema | `create-migration migration --description "<what>"` |
 
 Run `create-migration <command> --help` for flags. Pass every value as a flag:
@@ -136,6 +137,25 @@ release each part belongs to.
   `rename-column-step-2` drops the old column. Ship step 2 only after no
   running code uses the old name.
 
+### Change a lifecycle
+
+Lifecycles are statecharts: an SCXML file under `database/statecharts/`, turned
+into a `statechart/<name>-<version>` change by
+`select fsm.gen_statechart_sqitch_migrations(source_path => …, sqitch_plan_file_path => …)`
+after `create extension if not exists pg_statecharts_dev cascade` on the
+scratch database. A new version is a new file and a new change; machines
+already running keep the version they started with.
+
+- Callbacks are functions taking `fsm_event_payload`
+  (`create-migration function statechart`). Their change goes before the
+  chart's in the plan, because the chart's verify checks they exist. Keep
+  them short; queue slow work in a table instead of calling out.
+- A callback named by an older version must keep working while machines on
+  that version can reach it. Change behaviour with a new function.
+- Code sends events only through the entity's event function (for example
+  `billing.invoice_event`), which locks the owning row and refuses events
+  that do not apply. If the entity has none, write one.
+
 ## Rules
 
 Never:
@@ -153,7 +173,9 @@ Never:
   or foreign key without `not valid` (validate it in its own change);
 - raise or remove the `lock_timeout` a template sets;
 - use `exception when` blocks to retry inside PL/pgSQL;
-- deploy to, or connect to, any database other than a local or scratch one.
+- deploy to, or connect to, any database other than a local or scratch one;
+- edit a generated `statechart/` change, call `fsm.notify_state_machine` from
+  application code, or write to `fsm` tables yourself.
 
 Always:
 

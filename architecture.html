@@ -23,6 +23,7 @@
       <a href="git.html">Git and review</a>
       <a href="pipeline.html">Shipping safely</a>
       <a href="architecture.html" aria-current="page">Database design</a>
+      <a href="lifecycles.html">Lifecycles</a>
       <a href="agents.html">For agents</a>
       <a href="tools.html">Tools</a>
     </nav>
@@ -80,46 +81,8 @@ comment on schema portal_api is
 
     <h2 id="lifecycles">Lifecycles as statecharts</h2>
     <p>An invoice is drafted, sent, then paid or voided. The usual way to model that is a <code>status</code> column, and the usual result is that every writer has to know which moves are allowed, some of them get it wrong, and the history is overwritten with each update.</p>
-    <p>With <a href="tools.html#statecharts">statecharts</a>, the lifecycle is a chart the database executes:</p>
-<pre data-lang="plain">  draft ──send──▶ sent ──pay──▶ paid
-    │              │
-   void           void
-    │              │
-    └──▶ voided ◀──┘</pre>
-    <p class="filename">database/statecharts/invoice_flow-1.0.scxml</p>
-<pre data-lang="xml">&lt;scxml xmlns="http://www.w3.org/2005/07/scxml"
-       name="invoice_flow" version="1.0.0" initial="draft"&gt;
-  &lt;state id="draft"&gt;
-    &lt;transition event="invoice.send" target="sent"/&gt;
-    &lt;transition event="invoice.void" target="voided"/&gt;
-  &lt;/state&gt;
-  &lt;state id="sent"&gt;
-    &lt;transition event="invoice.pay"  target="paid"/&gt;
-    &lt;transition event="invoice.void" target="voided"/&gt;
-  &lt;/state&gt;
-  &lt;final id="paid"&gt;
-    &lt;onentry&gt;&lt;script src="billing.on_invoice_paid"/&gt;&lt;/onentry&gt;
-  &lt;/final&gt;
-  &lt;final id="voided"/&gt;
-&lt;/scxml&gt;</pre>
-    <ul>
-      <li><strong>One machine per row.</strong> The invoice table gets a <code>state_machine_id bigint not null</code>, indexed. A <code>before insert</code> trigger creates a machine with <code>fsm.create_state_machine_with_latest_statechart</code>, and an <code>after insert</code> trigger starts it.</li>
-      <li><strong>Events instead of updates.</strong> Code sends <code>select fsm.notify_state_machine(machine_id =&gt; …, event_name =&gt; 'invoice.pay')</code>. The transition and its callbacks run in the statement that sends the event, inside the caller's transaction, so the new state commits with the rest of the data or not at all. To ask whether an event would move the machine before sending it, use <code>fsm.is_valid_transition</code>.</li>
-      <li><strong>Callbacks write plain columns.</strong> <code>billing.on_invoice_paid</code> sets <code>paid_at</code> on the invoice, so ordinary queries read a column and never join the state log. <code>create-migration function statechart</code> writes the callback's skeleton.</li>
-      <li><strong>Branch with events.</strong> The engine has no guards. When the next state depends on data, a callback looks at the data and sends the next event.</li>
-      <li><strong>Queue slow work.</strong> A callback runs inside someone else's transaction. Calling a payment provider from it holds that transaction's locks for a network round trip; put a job on a queue instead.</li>
-      <li><strong>A recorded history.</strong> <code>fsm.state_machine_state</code> keeps every state each machine entered, with timestamps.</li>
-      <li><strong>Versioned charts.</strong> Each machine is created from a specific chart version. Changing the chart means a new version; rows created afterwards get it, and machines already running keep theirs.</li>
-    </ul>
-    <p>The chart reaches the database as an ordinary sqitch change. On a development machine, the <code>pg_statecharts_dev</code> extension reads the SCXML and writes the change and its plan line; it reads files on the database server, so the repository has to be mounted into the postgres container at the same path:</p>
-<pre data-lang="shell">mkdir -p database/{deploy,revert,verify}/statechart
-psql -c "create extension if not exists pg_statecharts_dev cascade" \
-     -c "select fsm.gen_statechart_sqitch_migrations(
-           source_path           =&gt; '/repo/database/statecharts',
-           sqitch_plan_file_path =&gt; '/repo/database/sqitch.plan')"</pre>
-    <p>That adds <code>statechart/invoice_flow-1.0.0</code>. Its verify script checks that every callback exists and takes one <code>fsm_event_payload</code>, so the callback's change must come before the chart's in the plan.</p>
-    <h3>When a status column is enough</h3>
-    <p>Statecharts pay for themselves when a lifecycle has rules worth enforcing and a history worth keeping: payments, orders, onboarding. A flag that only ever goes from false to true does not need one. Start with the entity whose invalid transitions have already cost you an incident.</p>
+    <p>We model a lifecycle like that as a statechart that PostgreSQL runs with <a href="tools.html#statecharts">pg_statecharts</a>. The chart is an SCXML file in the repository. The database refuses the moves it does not allow, runs a function on entering or leaving a state, commits the new state with the caller's data, and keeps every state a row has been in.</p>
+    <p><a href="lifecycles.html">Lifecycles</a> works through an invoice: the bugs a status column invites, the chart and its callbacks, and real output for refused events, rollbacks, a race between two requests, and a new chart version.</p>
 
     <h2 id="roles">Roles per duty</h2>
     <p>Give each kind of work a group role with only the grants it needs, and give each service's login user one of them.</p>
@@ -167,7 +130,7 @@ grant portal_role to portal_service;   <span class="c">-- the login user</span><
 
     <div class="next">
       <a href="pipeline.html">Shipping safely</a>
-      <a href="agents.html">Next: instructions for agents</a>
+      <a href="lifecycles.html">Next: lifecycles</a>
     </div>
   </article>
 </main>
