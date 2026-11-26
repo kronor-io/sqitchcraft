@@ -143,41 +143,55 @@ returning p.*;</pre></li>
 );</pre>
 
     <h2 id="idempotency">Idempotent writes</h2>
-    <p><strong>Every write a client may retry carries an idempotency key</strong>, reserved in the same transaction as the write, with <code>insert … on conflict</code>. The first request runs and stores its response; a repeat gets the stored response.</p>
-    <p>One detail matters at <code>SERIALIZABLE</code>. Looking a key up before inserting it takes a read lock on the index page where the key would go, and every concurrent request inserts its own key into that same page. Requests with different keys then abort each other with <code>40001</code>. Reserve the key with <code>on conflict</code> instead, whose uniqueness check takes no read lock, and look only in older partitions for keys that may already exist.</p>
-    <p>Incoming webhooks follow the same pattern: each is stored as a row first, and a trigger enqueues the job that processes it, so receiving one is a fast insert and a failure while processing it is retried like any other job. Statecharts ignore <a href="lifecycles.html#late">late and duplicate events</a>, so a provider that sends the same notification twice moves nothing twice.</p>
+    <p><strong>Every write a client may retry carries an idempotency key.</strong> The write's transaction reserves the key first:</p>
+<pre data-lang="sql">create table idempotency (
+    key text primary key,
+    response jsonb,
+    created_at timestamptz not null default now()
+);
+
+<span class="c">-- first statement of the write's transaction</span>
+insert into idempotency (key) values ('req-1')
+on conflict (key) do nothing
+returning key;
+
+<span class="c">-- a row came back: do the write, then keep its response</span>
+update idempotency set response = '{"payment_id": 42}' where key = 'req-1';
+
+<span class="c">-- no row came back: the key was used before, so replay</span>
+select response from idempotency where key = 'req-1';</pre>
+    <p>A duplicate sent while the first request is still running waits on the insert, fails with <code>40001</code> when the first commits, and its <a href="#retries">retry</a> finds the stored response.</p>
+    <p>Insert first and read only on a conflict. At <code>SERIALIZABLE</code>, a lookup before the insert locks the index page where the key would go, and concurrent requests with different keys abort each other.</p>
 
     <h2 id="timeouts">A timeout on everything</h2>
-    <p><strong>Each service connects as its own role, and each role has a <code>statement_timeout</code></strong> that fits its work:</p>
+    <p><strong>Each service connects as its own role, and each role has a <code>statement_timeout</code></strong> that fits its work. A query that runs past it is cancelled, instead of holding a connection, locks and a snapshot while everything behind it waits. Pick the shortest value the role's slowest legitimate query fits under, and raise it when a real query needs more:</p>
     <div class="table-wrap">
     <table class="plain">
-      <thead><tr><th>Role</th><th><code>statement_timeout</code></th></tr></thead>
+      <thead><tr><th>Kind of work</th><th>A starting <code>statement_timeout</code></th></tr></thead>
       <tbody>
-        <tr><td>Claiming jobs from the queue</td><td>1 s</td></tr>
-        <tr><td>Command-line tools</td><td>1.5 s</td></tr>
-        <tr><td>Merchant portal</td><td>3 s</td></tr>
-        <tr><td>Replica reads (exports, reports)</td><td>10 s</td></tr>
-        <tr><td>Workers</td><td>20 s</td></tr>
-        <tr><td>GraphQL reads</td><td>30 s</td></tr>
+        <tr><td>Claiming queued work: one short query that should be instant</td><td>1 s</td></tr>
+        <tr><td>Requests a person is waiting on (APIs, web pages)</td><td>1–3 s</td></tr>
+        <tr><td>Background workers</td><td>10–20 s</td></tr>
+        <tr><td>Reports and exports, on a replica</td><td>10–30 s</td></tr>
       </tbody>
     </table>
     </div>
 <pre data-lang="sql">-- both in milliseconds
-alter role portal_service set statement_timeout = 3000;
-alter role portal_service set idle_in_transaction_session_timeout = 900;</pre>
+alter role api_service set statement_timeout = 3000;
+alter role api_service set idle_in_transaction_session_timeout = 1000;</pre>
     <ul>
-      <li><strong><code>idle_in_transaction_session_timeout</code> of 900 ms</strong> ends a session that opened a transaction and stopped talking. The transaction it was holding open would otherwise keep its locks, and stop vacuum from cleaning up rows.</li>
+      <li><strong><code>idle_in_transaction_session_timeout</code> of about a second</strong> for services ends a session that opened a transaction and stopped talking. The transaction it was holding open would otherwise keep its locks, and stop vacuum from cleaning up rows.</li>
       <li><strong><code>lock_timeout</code> of 50 ms</strong> in every migration (<a href="pipeline.html#locks">why</a>), and in any function or trigger that takes a strong lock: <code>set local lock_timeout to '50ms'</code>. Waiting for a lock is how one slow transaction stalls everything queued behind it; giving up and retrying is cheaper.</li>
     </ul>
 
     <h2 id="connections">Connections</h2>
     <ul>
-      <li><strong>Pool with pgbouncer in transaction mode</strong>, with a pool size per role. A worker keeps separate pools for listening, claiming jobs, writing and reading from a replica, so a burst of one kind of work cannot take the connections another needs.</li>
+      <li><strong>Pool with pgbouncer in transaction mode</strong>, with a pool size per role. Give a service separate pools for separate kinds of work, such as listening, claiming jobs, writing and reading from a replica, so a burst of one cannot take the connections another needs.</li>
       <li><strong>Turn prepared statements off in one place</strong> for every pool behind a transaction-mode pgbouncer, rather than at each call site.</li>
       <li><strong>Read from a replica</strong> for exports and reports, at <code>REPEATABLE READ</code>.</li>
-      <li><strong>Give each kind of work its own role</strong> with only the grants it needs (<a href="architecture.html#roles">roles per duty</a>). The GraphQL layer connects read-only.</li>
+      <li><strong>Give each kind of work its own role</strong> with only the grants it needs (<a href="architecture.html#roles">roles per duty</a>). A layer that only reads, such as a GraphQL API, connects as a read-only role.</li>
       <li><strong>Pin <code>search_path</code> on every <code>security definer</code> function</strong>: <code>set search_path = pg_catalog, public</code>. Otherwise a caller can put its own schema first and change what the function calls.</li>
-      <li><strong>Use row-level security</strong> where a table holds data that must never cross tenants, such as card data, with a policy on a setting the transaction sets.</li>
+      <li><strong>Use row-level security</strong> where a table holds data that must never cross tenants, such as one customer's records in a shared table, with a policy on a setting the transaction sets.</li>
     </ul>
 
     <h2 id="data">Types that carry rules</h2>
@@ -187,30 +201,30 @@ alter role portal_service set idle_in_transaction_session_timeout = 900;</pre>
       <li><strong>Timestamps are <code>timestamptz</code></strong>, defaulting to <code>clock_timestamp()</code>.</li>
       <li><strong>Identifiers are <code>uuidv7()</code></strong> on PostgreSQL 18: unique without coordination, and time-ordered, so new rows land at the end of the index instead of all over it.</li>
       <li><strong>A set of values that changes is a lookup table with a foreign key</strong>, not an enum. Removing or renaming an enum value is a migration of every table that uses it.</li>
-      <li><strong>Every table and column has a <code>comment on</code></strong>, required by the table template (<a href="architecture.html#comments">why</a>).</li>
+      <li><strong>Every table and column has a <code>comment on</code></strong>, required by the table template, so it is never skipped (<a href="architecture.html#comments">why</a>).</li>
     </ul>
 
     <h2 id="performance">Staying fast</h2>
     <ul>
-      <li><strong>Never wrap an indexed column in a cast or function call in a predicate.</strong> <code>where id::text = payment_reference</code> cannot use the index on <code>id</code>, and a trigger written that way caused an outage. Cast the other side instead; sqint's <code>index/cast-on-column</code> catches it in review.</li>
-      <li><strong>Index whatever a callback looks up.</strong> A statechart callback finds its row by <code>state_machine_id</code> on every transition; without an index that is a sequential scan per transition, which on a payments table is an outage. Lead the index with that column.</li>
+      <li><strong>Never wrap an indexed column in a cast or function call in a predicate.</strong> <code>where id::text = reference</code> cannot use the index on <code>id</code>, so it reads the whole table; one trigger written that way is enough to take down a busy database. Cast the other side instead; sqint's <code>index/cast-on-column</code> catches it in review.</li>
+      <li><strong>Index whatever a callback looks up.</strong> A statechart callback finds its row by <code>state_machine_id</code> on every transition; without an index that is a sequential scan per transition, which on a busy table is an outage. Lead the index with that column.</li>
       <li><strong>Keep events proportional to work.</strong> The statechart event log is never purged, so nothing should send events on a timer for rows that are not changing.</li>
-      <li><strong>Move long backfills out of the deploy.</strong> A deploy registers the backfill and returns; a job runs it afterwards in keyset batches, paced, and throttled when replicas fall behind. One four-hour backfill run inline took a third of the database's time and made claiming a job go from 340 µs to 16 ms.</li>
-      <li><strong>Partition tables that grow with time</strong> (webhooks by month, idempotency keys by day) with pg_partman, so queries and vacuum work on the recent partition instead of the whole history.</li>
+      <li><strong>Move long backfills out of the deploy.</strong> A deploy registers the backfill and returns; a job runs it afterwards in keyset batches, paced, and throttled when replicas fall behind. A backfill of a few hours run inline can take a third of the database's time and make the hottest queries many times slower while it runs.</li>
+      <li><strong>Partition tables that grow with time</strong> (events by month, idempotency keys by day) with pg_partman, so queries and vacuum work on the recent partition instead of the whole history.</li>
       <li><strong>Tune autovacuum per table, with the reason in a comment</strong>: hot tables on a fixed row threshold, as the queue above.</li>
     </ul>
 
     <h2 id="observability">Seeing what happened</h2>
     <ul>
-      <li><strong>Every write sets the request id and trace context</strong> as transaction-local settings, through the same function that sets the isolation level. Triggers and functions can read them, and every job enqueued in the transaction copies them, so a payment can be followed from the HTTP request through the jobs it caused.</li>
-      <li><strong>Each statement gets a tracing span with its SQL text and never its parameters</strong>, which may hold personal or card data.</li>
+      <li><strong>Every write sets the request id and trace context</strong> as transaction-local settings, through the same function that sets the isolation level. Triggers and functions can read them, and every job enqueued in the transaction copies them, so a request can be followed from the HTTP call through the jobs it caused.</li>
+      <li><strong>Each statement gets a tracing span with its SQL text and never its parameters</strong>, which may hold personal data or secrets.</li>
       <li><strong>Log what is slow or blocked</strong>: <code>log_min_duration_statement = 20</code> (ms), <code>log_lock_waits = on</code>, <code>track_io_timing = on</code>, and <code>pg_stat_statements</code> with <code>track = all</code>, so statements inside functions are counted too.</li>
     </ul>
 
     <h2 id="testing">Testing against PostgreSQL</h2>
     <ul>
       <li><strong>Test against a real PostgreSQL</strong>, never a mock: integration tests run the services against a database deployed from the plan, and database functions have pgTAP tests run with <code>pg_prove</code>.</li>
-      <li><strong>Test races on purpose.</strong> A test that runs two requests for the same payment at once is the only way to see that serializable and the retry actually hold.</li>
+      <li><strong>Test races on purpose.</strong> A test that runs two requests for the same row at once is the only way to see that serializable and the retry actually hold.</li>
       <li><strong>Prepare every query against the new schema in CI</strong>, from both the code being merged and the code running in production (<a href="tools.html#hasql-check">hasql-check</a>), and lint every migration (<a href="tools.html#sqint">sqint</a>). <a href="pipeline.html#ci">Shipping safely</a> has the whole pipeline.</li>
     </ul>
 
