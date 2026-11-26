@@ -44,7 +44,6 @@
       <li><a href="#timeouts">A timeout on everything</a></li>
       <li><a href="#connections">Connections</a></li>
       <li><a href="#data">Types that carry rules</a></li>
-      <li><a href="#performance">Staying fast</a></li>
       <li><a href="#observability">Seeing what happened</a></li>
       <li><a href="#testing">Testing against PostgreSQL</a></li>
     </ul>
@@ -196,22 +195,10 @@ alter role api_service set idle_in_transaction_session_timeout = 1000;</pre>
 
     <h2 id="data">Types that carry rules</h2>
     <ul>
-      <li><strong>Money is an integer of minor units</strong>, in a domain: <code>create domain currency_unit as bigint</code>. No rounding, no floating point, and the type says what the number is.</li>
       <li><strong>Bounded text is a domain</strong> (<code>text_100</code>), so a limit is declared once and every column that uses it agrees.</li>
       <li><strong>Timestamps are <code>timestamptz</code></strong>, defaulting to <code>clock_timestamp()</code>.</li>
-      <li><strong>Identifiers are <code>uuidv7()</code></strong> on PostgreSQL 18: unique without coordination, and time-ordered, so new rows land at the end of the index instead of all over it.</li>
       <li><strong>A set of values that changes is a lookup table with a foreign key</strong>, not an enum. Removing or renaming an enum value is a migration of every table that uses it.</li>
       <li><strong>Every table and column has a <code>comment on</code></strong>, required by the table template, so it is never skipped (<a href="architecture.html#comments">why</a>).</li>
-    </ul>
-
-    <h2 id="performance">Staying fast</h2>
-    <ul>
-      <li><strong>Never wrap an indexed column in a cast or function call in a predicate.</strong> <code>where id::text = reference</code> cannot use the index on <code>id</code>, so it reads the whole table; one trigger written that way is enough to take down a busy database. Cast the other side instead; sqint's <code>index/cast-on-column</code> catches it in review.</li>
-      <li><strong>Index whatever a callback looks up.</strong> A statechart callback finds its row by <code>state_machine_id</code> on every transition; without an index that is a sequential scan per transition, which on a busy table is an outage. Lead the index with that column.</li>
-      <li><strong>Keep events proportional to work.</strong> The statechart event log is never purged, so nothing should send events on a timer for rows that are not changing.</li>
-      <li><strong>Move long backfills out of the deploy.</strong> A deploy registers the backfill and returns; a job runs it afterwards in keyset batches, paced, and throttled when replicas fall behind. A backfill of a few hours run inline can take a third of the database's time and make the hottest queries many times slower while it runs.</li>
-      <li><strong>Partition tables that grow with time</strong> (events by month, idempotency keys by day) with pg_partman, so queries and vacuum work on the recent partition instead of the whole history.</li>
-      <li><strong>Tune autovacuum per table, with the reason in a comment</strong>: hot tables on a fixed row threshold, as the queue above.</li>
     </ul>
 
     <h2 id="observability">Seeing what happened</h2>
