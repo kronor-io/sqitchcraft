@@ -70,12 +70,12 @@ end;</pre>
     <p><strong>Every transaction that writes runs at <code>SERIALIZABLE</code>.</strong> It is what makes read-modify-write logic correct without anyone having to think about it: two transactions that would interleave badly cannot both commit. Code that would otherwise take an advisory lock or a <code>select … for update</code> to protect a check-then-write relies on the isolation level instead, and a reviewer does not have to reason about every possible interleaving.</p>
     <p>Set it in the one function every write goes through, so no call site can choose differently. A role default is a useful backstop for anything that connects without that function, such as psql:</p>
 <pre data-lang="sql">alter role app set default_transaction_isolation = 'serializable';</pre>
-    <p>Two exceptions are written down next to the code, with the reason:</p>
+    <p>Two kinds of transaction are better off at a lower level. Make each one a separate, named function, and say why in its documentation, so it is never picked by accident:</p>
     <ul>
       <li><strong>Backfill batches run at <code>READ COMMITTED</code>.</strong> A thousand-row <code>update</code> at <code>SERIALIZABLE</code> takes a thousand predicate locks. Past <code>max_pred_locks_per_transaction</code>, PostgreSQL turns them into page and relation locks, and unrelated production transactions on the same table start failing. A batch is safe without serializable because each one owns its key range and is idempotent.</li>
       <li><strong>Reads from a hot standby run at <code>REPEATABLE READ</code></strong>, because a standby refuses <code>SERIALIZABLE</code>.</li>
     </ul>
-    <p>Raise <code>max_pred_locks_per_transaction</code> (we run 1024) so ordinary transactions do not reach that escalation.</p>
+    <p>Raise <code>max_pred_locks_per_transaction</code> well above its default of 64, to 1024 for example, so ordinary transactions do not reach that escalation.</p>
 
     <h2 id="retries">Retry what lost a race</h2>
     <p><strong>Retry a transaction that fails with SQLSTATE <code>40001</code> (serialization failure) or <code>40P01</code> (deadlock), automatically, in the same function that set the isolation level.</strong> Both mean the transaction lost a race and nothing it did survived, so running it again is safe. Callers never see them.</p>
@@ -103,7 +103,7 @@ end;</pre>
       <li>If the transaction rolls back, the call cannot be taken back: the provider charged the card, but the database has no payment.</li>
       <li>While the call waits on the network, the transaction holds its row locks and its snapshot, so other writers queue behind it and vacuum cannot clean up.</li>
     </ul>
-    <p>Make it impossible rather than discouraged. In Haskell, our transactions are values of hasql's <code>Transaction</code> type, which cannot perform IO, so an HTTP call inside one does not compile. In other languages, keep the transaction in a function that takes only the database handle.</p>
+    <p>Make it impossible rather than discouraged. In Haskell, write transactions as values of hasql's <code>Transaction</code> type, which cannot perform IO, so an HTTP call inside one does not compile. In other languages, keep the transaction in a function that takes only the database handle.</p>
     <p>Instead, the transaction records what has to happen, and something else does it after the commit:</p>
     <ul>
       <li><strong>Enqueue a job</strong> in the same transaction as the data it is about (<a href="#queues">below</a>). A request that starts a payment writes the payment and its job, commits, and returns; a worker calls the provider.</li>
