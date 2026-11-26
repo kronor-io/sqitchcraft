@@ -44,7 +44,6 @@
       <li><a href="#timeouts">A timeout on everything</a></li>
       <li><a href="#connections">Connections</a></li>
       <li><a href="#data">Types that carry rules</a></li>
-      <li><a href="#observability">Seeing what happened</a></li>
       <li><a href="#testing">Testing against PostgreSQL</a></li>
     </ul>
   </nav>
@@ -199,13 +198,6 @@ alter role api_service set idle_in_transaction_session_timeout = 1000;</pre>
       <li><strong>Timestamps are <code>timestamptz</code></strong>, defaulting to <code>clock_timestamp()</code>.</li>
       <li><strong>A set of values that changes is a lookup table with a foreign key</strong>, not an enum. Removing or renaming an enum value is a migration of every table that uses it.</li>
       <li><strong>Every table and column has a <code>comment on</code></strong>, required by the table template, so it is never skipped (<a href="architecture.html#comments">why</a>).</li>
-    </ul>
-
-    <h2 id="observability">Seeing what happened</h2>
-    <ul>
-      <li><strong>Every write sets the request id and trace context</strong> as transaction-local settings, through the same function that sets the isolation level. Triggers and functions can read them, and every job enqueued in the transaction copies them, so a request can be followed from the HTTP call through the jobs it caused.</li>
-      <li><strong>Each statement gets a tracing span with its SQL text and never its parameters</strong>, which may hold personal data or secrets.</li>
-      <li><strong>Log what is slow or blocked</strong>: <code>log_min_duration_statement = 20</code> (ms), <code>log_lock_waits = on</code>, <code>track_io_timing = on</code>, and <code>pg_stat_statements</code> with <code>track = all</code>, so statements inside functions are counted too.</li>
     </ul>
 
     <h2 id="testing">Testing against PostgreSQL</h2>
