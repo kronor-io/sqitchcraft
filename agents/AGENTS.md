@@ -3,7 +3,8 @@
 This project keeps its PostgreSQL schema in a sqitch project under `database/`,
 one file per object, and changes it with sqiff, create-migration, sqint and
 psql-retry. Follow this section for any change under `database/` or to
-`sqitch.conf`, `sqiff.yaml` or `database/sqitch*.plan`.
+`sqitch.conf`, `sqiff.yaml` or `database/sqitch*.plan`, and for any code that
+opens a transaction or sends SQL to the database.
 
 The sqitchcraft guide explains the layout, works through examples and gives
 the reasons behind each rule below: https://kronor-io.github.io/sqitchcraft/
@@ -63,6 +64,19 @@ definition, written as if creating the object today: `create table if not
 exists`, `create or replace function`, `create or replace view`, with `comment
 on` for the object and its columns. Make the verify script exercise the object
 (select from it, call the function) so a broken deploy fails.
+
+Write a function whose body is plain SQL with a `begin atomic` body, so
+PostgreSQL checks it when the deploy creates it instead of at the first call.
+Every `security definer` function sets its search path:
+`set search_path = pg_catalog, public`.
+
+### Where a rule goes
+
+Put a rule where every writer passes through it, preferring, in this order:
+types and constraints (domains, `check`, foreign keys), generated columns and
+views, functions called as one statement, and statecharts for processes. Do not
+check in application code what the database can refuse. A set of values that
+will change is a lookup table with a foreign key, not an enum.
 
 ### Change a table
 
@@ -183,6 +197,23 @@ already running keep the version they started with.
   `REPEATABLE READ`) and is retried on SQLSTATE `40001`. At `READ COMMITTED`,
   two concurrent events can leave a machine in two states at once.
 
+## Code that talks to the database
+
+- Every transaction that writes runs at `SERIALIZABLE`, through the project's
+  function for writes, which also retries SQLSTATE `40001` and `40P01`. Do not
+  open transactions another way. Do not add an advisory lock or
+  `select … for update` to protect a read-then-write: the isolation level
+  already does.
+- Never call another system while a transaction is open: no HTTP request, email
+  or message to a broker inside one, because a retry repeats it and a rollback
+  cannot undo it. Record the work in the same transaction, as a job or a
+  `pgmq.send`, and let a worker do it after the commit.
+- A write a client may retry takes an idempotency key. Reserve the key as the
+  transaction's first statement with
+  `insert … on conflict (key) do nothing returning key`; read the stored
+  response only when no row comes back. Never look the key up first.
+- Workers claim queued rows with `for update skip locked`.
+
 ## Rules
 
 Never:
@@ -198,7 +229,10 @@ Never:
   migration);
 - build an index without `concurrently` on an existing table, or add a check
   or foreign key without `not valid` (validate it in its own change);
-- raise or remove the `lock_timeout` a template sets;
+- raise or remove the `lock_timeout` a template sets, or a role's
+  `statement_timeout`;
+- call another system with a transaction open, or look up an idempotency key
+  before inserting it;
 - use `exception when` blocks to retry inside PL/pgSQL;
 - deploy to, or connect to, any database other than a local or scratch one;
 - track where a row is in a process with a status column, an enum, flags or
@@ -214,7 +248,9 @@ Always:
 - if the project uses pgfmt, run it on the SQL files you add or change, but
   never on a `@tag` snapshot or a migration that is already on the main branch;
 - keep every change backwards compatible with the code that is running while
-  it deploys: add first, remove in a later release.
+  it deploys: add first, remove in a later release;
+- add a test that runs against PostgreSQL for each function you add or change
+  (pgTAP or the project's integration tests), never against a mock.
 
 ## Merging and rebasing
 
@@ -266,7 +302,9 @@ database as well as `PG*`.
 - a check fails and the fix would break one of the rules above;
 - the task would extend a process that is already tracked with a status
   column or flags: propose moving it to a statechart, and ask before
-  extending the column.
+  extending the column;
+- a transaction seems to need an isolation level below `SERIALIZABLE`, or a
+  query needs more time than its role's `statement_timeout`.
 
 ## Report
 
