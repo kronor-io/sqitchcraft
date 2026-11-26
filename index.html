@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sqitchcraft: PostgreSQL schema changes with sqitch</title>
-<meta name="description" content="Keep each PostgreSQL table, view and function in one file that says what it is today. Edit it, and let the tools write, check and deploy the migration.">
+<meta name="description" content="Tools and a development philosophy for keeping data-driven applications on PostgreSQL solid as they change, built on sqitch. Keep each PostgreSQL table, view and function in one file that says what it is today. Edit it, and let the tools write, check and deploy the migration.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
@@ -32,6 +32,7 @@
 
 <main id="main">
   <section class="hero-split">
+    <p class="about">sqitchcraft is a set of tools and a development philosophy for keeping data-driven applications on PostgreSQL solid as they change. The database holds the schema, the rules about the data and the lifecycle of each row, and every change to it is a <a href="https://sqitch.org">sqitch</a> change: versioned in git, reviewed, deployed in order, and reverted when it has to be.</p>
     <h1>Edit the table. Let the tools write the migration.</h1>
     <p class="lede">In most projects, a table's definition is spread across every migration that ever touched it. Here each table, view and function has one file that says what it is today. You change that file, and the migration that upgrades existing databases is written for you, reviewed beside your edit, and deployed with care.</p>
 

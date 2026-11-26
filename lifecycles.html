@@ -145,61 +145,22 @@
     <p>Read it as the answer to the four bugs. There is no transition out of <code>voided</code> or <code>paid</code>, so nothing pays a voided invoice. Leaving <code>open</code> cancels reminders, whichever event leaves it. <code>pay</code> is written once, on <code>open</code>, so adding a state inside <code>open</code> later (say, <code>disputed</code>) needs no new payment transition. The format is <a href="https://www.w3.org/TR/scxml/">W3C SCXML</a>, so the chart can be drawn by tools that are not ours.</p>
 
     <h2 id="callbacks">What each state does</h2>
-    <p>The <code>onentry</code> and <code>onexit</code> scripts are ordinary PostgreSQL functions. Each one takes an <code>fsm_event_payload</code> (the machine, the event and its data, the states it moves from and to) and finds its invoice by the machine's id:</p>
+    <p>The <code>onentry</code> and <code>onexit</code> scripts are ordinary PostgreSQL functions. Each one takes an <code>fsm_event_payload</code> (the machine, the event and its data, the states it moves from and to) and finds its invoice by the machine's id. Emails go to <code>billing_email</code>, a <a href="#queue">pgmq queue</a> in the same database:</p>
     <p class="filename">database/deploy/billing/function/invoice_callbacks.sql</p>
 <pre data-lang="sql"><span class="c">-- on_entry of open: the invoice goes out.</span>
 create or replace function billing.send_invoice(event_payload fsm_event_payload)
     returns void as
 $$
-    with issued as (
-        update billing.invoice
-        set issued_at = now()
-        where state_machine_id = (event_payload).machine_id
-        returning id
-    )
-    insert into billing.outbox (invoice_id, kind)
-    select id, 'invoice' from issued;
+    update billing.invoice
+    set issued_at = now()
+    where state_machine_id = (event_payload).machine_id;
+
+    select pgmq.send('billing_email', jsonb_build_object('invoice_id', id, 'kind', 'invoice'))
+    from billing.invoice
+    where state_machine_id = (event_payload).machine_id;
 $$ language sql;
 
-<span class="c">-- on_exit of open, however it is left: a reminder that has not gone out
--- yet must not go out now.</span>
-create or replace function billing.cancel_reminders(event_payload fsm_event_payload)
-    returns void as
-$$
-    update billing.outbox o
-    set cancelled_at = now()
-    from billing.invoice i
-    where i.state_machine_id = (event_payload).machine_id
-      and o.invoice_id = i.id
-      and o.kind = 'reminder'
-      and o.sent_at is null
-      and o.cancelled_at is null;
-$$ language sql;
-
-<span class="c">-- queue_reminder, settle_invoice and void_invoice follow the same pattern.</span></pre>
-    <div class="table-wrap">
-    <table class="plain">
-      <thead><tr><th>State</th><th>On entry</th><th>On exit</th></tr></thead>
-      <tbody>
-        <tr><td><code>open</code></td><td>set <code>issued_at</code>, queue the invoice email</td><td>cancel unsent reminders</td></tr>
-        <tr><td><code>overdue</code></td><td>queue a reminder</td><td></td></tr>
-        <tr><td><code>paid</code></td><td>set <code>settled_at</code>, queue a receipt</td><td></td></tr>
-        <tr><td><code>voided</code></td><td>set <code>voided_at</code></td><td></td></tr>
-      </tbody>
-    </table>
-    </div>
-    <p>Two habits keep callbacks cheap and queries plain:</p>
-    <ul>
-      <li><strong>Write columns that queries read.</strong> <code>settled_at</code> is on the invoice, so a report filters on a column and never joins the state log.</li>
-      <li><strong>Queue slow work.</strong> A callback runs inside the transaction that sent the event. It writes to <code>billing.outbox</code>, and a worker sends the email after that transaction commits. An HTTP call from inside a callback would hold the invoice's locks for the length of a network round trip, and could not be taken back if the transaction then rolled back.</li>
-    </ul>
-    <p><code>create-migration function statechart</code> writes a callback's skeleton with the payload already unpacked.</p>
-
-    <h3 id="pgmq">The outbox as a queue</h3>
-    <p><code>billing.outbox</code> is a plain table, so the example needs nothing else. A queue inside PostgreSQL, such as <a href="https://github.com/pgmq/pgmq">pgmq</a>, does the same job and gives the worker visibility timeouts, retries and an archive. Its messages are rows too, so they commit or roll back with the event that queued them. The callbacks send to it instead of inserting, and the reminder keeps its message's id so that leaving <code>open</code> can take it back out:</p>
-<pre data-lang="sql">select pgmq.create('billing_email');
-
-<span class="c">-- on_entry of overdue</span>
+<span class="c">-- on_entry of overdue: remind the customer, and keep the message's id.</span>
 create or replace function billing.queue_reminder(event_payload fsm_event_payload)
     returns void as
 $$
@@ -209,7 +170,8 @@ $$
     where state_machine_id = (event_payload).machine_id;
 $$ language sql;
 
-<span class="c">-- on_exit of open</span>
+<span class="c">-- on_exit of open, however it is left: a reminder still in the queue
+-- must not go out now.</span>
 create or replace function billing.cancel_reminders(event_payload fsm_event_payload)
     returns void as
 $$
@@ -217,14 +179,39 @@ $$
     from billing.invoice
     where state_machine_id = (event_payload).machine_id
       and reminder_msg_id is not null;
-$$ language sql;</pre>
-    <p><code>send_invoice</code> and <code>settle_invoice</code> call <code>pgmq.send</code> the same way. After invoice 1 is issued, goes overdue and is paid, the worker reads:</p>
+$$ language sql;
+
+<span class="c">-- settle_invoice and void_invoice follow the same pattern.</span></pre>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>State</th><th>On entry</th><th>On exit</th></tr></thead>
+      <tbody>
+        <tr><td><code>open</code></td><td>set <code>issued_at</code>, queue the invoice email</td><td>delete a queued reminder</td></tr>
+        <tr><td><code>overdue</code></td><td>queue a reminder</td><td></td></tr>
+        <tr><td><code>paid</code></td><td>set <code>settled_at</code>, queue a receipt</td><td></td></tr>
+        <tr><td><code>voided</code></td><td>set <code>voided_at</code></td><td></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Two habits keep callbacks cheap and queries plain:</p>
+    <ul>
+      <li><strong>Write columns that queries read.</strong> <code>settled_at</code> is on the invoice, so a report filters on a column and never joins the state log.</li>
+      <li><strong>Queue slow work.</strong> A callback runs inside the transaction that sent the event. It queues the email, and a worker sends it after that transaction commits. An HTTP call from inside a callback would hold the invoice's locks for the length of a network round trip, and could not be taken back if the transaction then rolled back.</li>
+    </ul>
+    <p><code>create-migration function statechart</code> writes a callback's skeleton with the payload already unpacked.</p>
+
+    <h3 id="queue">The email queue</h3>
+    <p>The queue is <a href="https://github.com/pgmq/pgmq">pgmq</a>, a message queue built from PostgreSQL tables. Its messages are rows, so they commit or roll back with the event that queued them, and a callback can delete one it queued earlier, as <code>cancel_reminders</code> does. A plain outbox table with a <code>sent_at</code> column would work as well; pgmq adds what the worker would otherwise write itself: visibility timeouts, retries and an archive. The queue is a change of its own:</p>
+    <p class="filename">database/deploy/billing/queue/email.sql</p>
+<pre data-lang="sql"><span class="c">-- A worker reads each email, sends it, then archives the message.</span>
+select pgmq.create('billing_email');</pre>
+    <p>After invoice 1 is issued, goes overdue and is paid (<a href="#run">below</a>), the worker reads:</p>
 <pre data-lang="shell"><span class="p">=# </span>select msg_id, message from pgmq.read('billing_email', vt =&gt; 30, qty =&gt; 10);
  msg_id |               message
 --------+--------------------------------------
       1 | {"kind": "invoice", "invoice_id": 1}
       3 | {"kind": "receipt", "invoice_id": 1}</pre>
-    <p>Message 2, the reminder, was deleted when the payment left <code>open</code>. The worker sends each email and then calls <code>pgmq.archive</code>; a message it does not archive within 30 seconds is read again. A reminder the worker is sending at that moment can still go out, as it could from the outbox table. pgmq is pure SQL, like pg_statecharts, so it installs wherever pg_statecharts does.</p>
+    <p>Message 2, the reminder, was deleted when the payment left <code>open</code>. The worker sends each email and then calls <code>pgmq.archive</code>; a message it does not archive within 30 seconds is read again. A reminder the worker is sending at that moment can still go out. pgmq is pure SQL, like pg_statecharts, so it installs wherever pg_statecharts does.</p>
 
     <h2 id="run">One invoice, start to finish</h2>
     <p>Inserting an invoice creates its machine and starts it in <code>draft</code> (two triggers, <a href="#repo">below</a>). From then on, the application changes the invoice's state only by sending events, through one function, <code>billing.invoice_event</code>, which returns the states the machine is in afterwards:</p>
@@ -245,32 +232,33 @@ $$ language sql;</pre>
 ---------------
  open/overdue
 
-<span class="p">=# </span>select kind, sent_at, cancelled_at
-   from billing.outbox where invoice_id = 1 order by id;
-   kind   | sent_at | cancelled_at
-----------+---------+--------------
- invoice  |         |
- reminder |         |</pre>
-    <p>Entering <code>open</code> queued the invoice email; entering <code>overdue</code> queued a reminder, which the worker has not sent yet. Now the customer pays:</p>
+<span class="p">=# </span>select msg_id, message-&gt;&gt;'kind' as kind
+   from pgmq.q_billing_email
+   where message-&gt;&gt;'invoice_id' = '1' order by msg_id;
+ msg_id |   kind
+--------+----------
+      1 | invoice
+      2 | reminder</pre>
+    <p>pgmq keeps a queue's messages in a table, <code>pgmq.q_billing_email</code>. Entering <code>open</code> queued the invoice email; entering <code>overdue</code> queued a reminder, which the worker has not sent yet. Now the customer pays:</p>
 <pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.pay');
  invoice_event
 ---------------
  paid
 
-<span class="p">=# </span>select kind, sent_at, cancelled_at is not null as cancelled
-   from billing.outbox where invoice_id = 1 order by id;
-   kind   | sent_at | cancelled
-----------+---------+-----------
- invoice  |         | f
- reminder |         | t
- receipt  |         | f
+<span class="p">=# </span>select msg_id, message-&gt;&gt;'kind' as kind
+   from pgmq.q_billing_email
+   where message-&gt;&gt;'invoice_id' = '1' order by msg_id;
+ msg_id |  kind
+--------+---------
+      1 | invoice
+      3 | receipt
 
 <span class="p">=# </span>select issued_at is not null as issued, settled_at is not null as settled
    from billing.invoice where id = 1;
  issued | settled
 --------+---------
  t      | t</pre>
-    <p><code>pay</code> was defined on <code>open</code> and worked from <code>overdue</code>. Leaving <code>open</code> cancelled the reminder, so the customer gets a receipt and not a reminder for an invoice they just paid. No payment code had to know reminders exist.</p>
+    <p><code>pay</code> was defined on <code>open</code> and worked from <code>overdue</code>. Leaving <code>open</code> deleted the reminder from the queue, so the customer gets a receipt and not a reminder for an invoice they just paid. No payment code had to know reminders exist.</p>
 
     <h2 id="late">Late and duplicate events</h2>
     <p>Events arrive late and more than once. The payment provider retries a webhook it thinks we missed; the back office voids an invoice the customer paid a minute earlier. Invoice 1 is paid, and gets both:</p>
@@ -284,12 +272,13 @@ $$ language sql;</pre>
 ---------------
  paid
 
-<span class="p">=# </span>select kind from billing.outbox where invoice_id = 1 order by id;
-   kind
-----------
- invoice
- reminder
- receipt
+<span class="p">=# </span>select msg_id, message-&gt;&gt;'kind' as kind
+   from pgmq.q_billing_email
+   where message-&gt;&gt;'invoice_id' = '1' order by msg_id;
+ msg_id |  kind
+--------+---------
+      1 | invoice
+      3 | receipt
 
 <span class="p">=# </span>select name, to_char(created_at, 'HH24:MI:SS.MS') as received
    from fsm.state_machine_event
@@ -297,12 +286,12 @@ $$ language sql;</pre>
    order by id;
           name           |   received
 -------------------------+--------------
- invoice.issue           | 07:53:23.925
- invoice.due_date_passed | 07:53:23.935
- invoice.pay             | 07:53:23.937
- done.state.paid         | 07:53:23.937
- invoice.pay             | 07:53:23.942
- invoice.void            | 07:53:23.943</pre>
+ invoice.issue           | 08:36:54.019
+ invoice.due_date_passed | 08:36:54.024
+ invoice.pay             | 08:36:54.027
+ done.state.paid         | 08:36:54.027
+ invoice.pay             | 08:36:54.030
+ invoice.void            | 08:36:54.031</pre>
     <p>Neither changed anything. <code>paid</code> has no transitions, so no active state accepts either event: the invoice stays paid, no callback runs, and the customer gets one receipt, not two. Both calls succeed, and both events are in the log with the time they arrived.</p>
     <p>That is the behaviour we want. A late or repeated event is normal traffic, not a mistake, and raising an error for it would only make every caller catch and ignore it. The webhook handler does not check whether the invoice is already paid, and the void button does not check whether it still can: each sends its event, and the chart decides. A caller that needs to know what happened reads the states the call returns.</p>
     <p>The application sends events through one function per entity, which finds the machine from the invoice and returns its states afterwards:</p>
@@ -352,7 +341,8 @@ $$ language plpgsql;</pre>
 <span class="p">=# </span>rollback;
 <span class="p">=# </span>select fsm.is_state_active(machine_id =&gt; state_machine_id, state_id =&gt; 'open') as open,
           settled_at is not null as settled,
-          (select count(*) from billing.outbox o where o.invoice_id = 2 and kind = 'receipt') as receipts
+          (select count(*) from pgmq.q_billing_email q
+           where q.message-&gt;&gt;'invoice_id' = '2' and q.message-&gt;&gt;'kind' = 'receipt') as receipts
    from billing.invoice where id = 2;
  open | settled | receipts
 ------+---------+----------
@@ -400,11 +390,11 @@ Time: 1510.915 ms (00:01.511)
    order by entered_at, state_id;
      state_id     |   entered    |    exited
 ------------------+--------------+--------------
- draft            | 07:53:23.914 | 07:53:23.932
- awaiting_payment | 07:53:23.925 | 07:53:23.937
- open             | 07:53:23.925 | 07:53:23.939
- overdue          | 07:53:23.935 | 07:53:23.939
- paid             | 07:53:23.937 |</pre>
+ draft            | 08:36:54.014 | 08:36:54.022
+ awaiting_payment | 08:36:54.019 | 08:36:54.026
+ open             | 08:36:54.019 | 08:36:54.028
+ overdue          | 08:36:54.024 | 08:36:54.028
+ paid             | 08:36:54.027 |</pre>
     <p>Nobody wrote an audit table, and it cannot drift from the state, because it is the state: the current states are the rows with no <code>exited_at</code>. Questions that used to need an analytics pipeline are one query:</p>
 <pre data-lang="sql"><span class="c">-- How long do invoices stay overdue before they are paid?</span>
 select percentile_cont(0.5) within group (order by exited_at - entered_at)
@@ -421,6 +411,7 @@ where o.state_id = 'overdue';</pre>
 ├── deploy/
 │   ├── billing/
 │   │   ├── table/invoice.sql                  <span class="c"># state_machine_id bigint not null unique</span>
+│   │   ├── queue/email.sql                    <span class="c"># pgmq.create('billing_email')</span>
 │   │   └── function/
 │   │       ├── invoice_callbacks.sql          <span class="c"># what each state does</span>
 │   │       └── invoice_event.sql              <span class="c"># the wrapper, and the two triggers</span>
@@ -448,9 +439,11 @@ insert into fsm.transition (statechart_id, event, source_state, target_state) va
 (chart, 'invoice.due_date_passed', 'awaiting_payment', 'overdue');</pre>
     <p>Its verify script checks that every callback the chart names exists, so the callbacks' change comes first in the plan. The plan for the example:</p>
 <pre data-lang="plan">extension/pg_statecharts
+extension/pgmq
 billing/schema
 billing/table/invoice [billing/schema]
-billing/function/invoice_callbacks [billing/table/invoice]
+billing/queue/email [extension/pgmq]
+billing/function/invoice_callbacks [billing/table/invoice billing/queue/email]
 statechart/invoice_flow-1.0.0
 billing/function/invoice_event [statechart/invoice_flow-1.0.0]</pre>
     <p>Each invoice gets its machine from two triggers: a <code>before insert</code> one fills <code>state_machine_id</code> with <code>fsm.create_state_machine_with_latest_statechart(statechart_name =&gt; 'invoice_flow')</code>, and an <code>after insert</code> one calls <code>fsm.start_machine</code>, which enters <code>draft</code> and runs its callbacks once the row exists. The whole project deploys, verifies, reverts and deploys again with sqitch.</p>

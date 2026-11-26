@@ -166,7 +166,9 @@ already running keep the version they started with.
 - Callbacks are functions taking `fsm_event_payload`
   (`create-migration function statechart`). Their change goes before the
   chart's in the plan, because the chart's verify checks they exist. Keep
-  them short; queue slow work in a table instead of calling out.
+  them short. Never call out from a callback: queue slow work in the
+  database, in a pgmq queue if the project has one (`pgmq.send`), for a
+  worker to do after the transaction commits.
 - A callback named by an older version must keep working while machines on
   that version can reach it. Change behaviour with a new function.
 - Code sends events only through the entity's event function (for example
