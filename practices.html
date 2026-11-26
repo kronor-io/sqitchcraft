@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Practices · sqitchcraft</title>
+<meta name="description" content="The practices Kronor follows to keep a busy PostgreSQL database fast and its code clean: logic in the database, serializable transactions retried automatically, no side effects inside a transaction, timeouts on every role, and queues that workers claim safely.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="index.html"><img src="assets/mark.svg" alt="" width="26" height="26">sqitchcraft</a>
+    <nav aria-label="Site">
+      <a href="layout.html">The layout</a>
+      <a href="workflow.html">One change</a>
+      <a href="functions.html">Functions</a>
+      <a href="git.html">Git and review</a>
+      <a href="pipeline.html">Shipping safely</a>
+      <a href="architecture.html">Database design</a>
+      <a href="lifecycles.html">Lifecycles</a>
+      <a href="practices.html" aria-current="page">Practices</a>
+      <a href="agents.html">For agents</a>
+      <a href="tools.html">Tools</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="doc">
+  <nav class="toc" aria-label="On this page">
+    <p>On this page</p>
+    <ul>
+      <li><a href="#logic">Logic in the database</a></li>
+      <li><a href="#serializable">Serializable, always</a></li>
+      <li><a href="#retries">Retry what lost a race</a></li>
+      <li><a href="#side-effects">No side effects in a transaction</a></li>
+      <li><a href="#queues">Work queues</a></li>
+      <li><a href="#idempotency">Idempotent writes</a></li>
+      <li><a href="#timeouts">A timeout on everything</a></li>
+      <li><a href="#connections">Connections</a></li>
+      <li><a href="#data">Types that carry rules</a></li>
+      <li><a href="#performance">Staying fast</a></li>
+      <li><a href="#observability">Seeing what happened</a></li>
+      <li><a href="#testing">Testing against PostgreSQL</a></li>
+    </ul>
+  </nav>
+
+  <article>
+    <h1>Practices</h1>
+    <p class="lede">Kronor processes payments on one PostgreSQL database that every service shares. These are the habits that keep it fast under load and keep the code around it simple. Most of them are enforced somewhere, in a type, a role setting, a template or a CI check, rather than left to memory.</p>
+
+    <h2 id="logic">Logic in the database</h2>
+    <p><strong>Put rules where every writer has to pass through them.</strong> Constraints, domains, generated columns, views, functions, triggers and <a href="lifecycles.html">statecharts</a> hold the business logic; services call a narrow set of functions and read views. A rule in one service is a rule every other service can break, and a rule in the database is checked in the same transaction as the write it guards. <a href="architecture.html#rules">Database design</a> sets out the order to prefer them in.</p>
+    <p><strong>Write SQL function bodies in SQL-standard form</strong> where the body is plain SQL. A <code>begin atomic</code> body is parsed when the function is created, so a missing column fails the deploy instead of the first call, and PostgreSQL records what the function depends on:</p>
+<pre data-lang="sql">create or replace function billing.invoice_total(invoice_id bigint)
+    returns numeric
+    language sql stable
+begin atomic
+    select sum(amount)
+    from billing.invoice_line l
+    where l.invoice_id = invoice_total.invoice_id;
+end;</pre>
+
+    <h2 id="serializable">Serializable, always</h2>
+    <p><strong>Every transaction that writes runs at <code>SERIALIZABLE</code>.</strong> It is what makes read-modify-write logic correct without anyone having to think about it: two transactions that would interleave badly cannot both commit. Code that would otherwise take an advisory lock or a <code>select … for update</code> to protect a check-then-write relies on the isolation level instead, and a reviewer does not have to reason about every possible interleaving.</p>
+    <p>Set it in the one function every write goes through, so no call site can choose differently. A role default is a useful backstop for anything that connects without that function, such as psql:</p>
+<pre data-lang="sql">alter role app set default_transaction_isolation = 'serializable';</pre>
+    <p>Two exceptions are written down next to the code, with the reason:</p>
+    <ul>
+      <li><strong>Backfill batches run at <code>READ COMMITTED</code>.</strong> A thousand-row <code>update</code> at <code>SERIALIZABLE</code> takes a thousand predicate locks. Past <code>max_pred_locks_per_transaction</code>, PostgreSQL turns them into page and relation locks, and unrelated production transactions on the same table start failing. A batch is safe without serializable because each one owns its key range and is idempotent.</li>
+      <li><strong>Reads from a hot standby run at <code>REPEATABLE READ</code></strong>, because a standby refuses <code>SERIALIZABLE</code>.</li>
+    </ul>
+    <p>Raise <code>max_pred_locks_per_transaction</code> (we run 1024) so ordinary transactions do not reach that escalation.</p>
+
+    <h2 id="retries">Retry what lost a race</h2>
+    <p><strong>Retry a transaction that fails with SQLSTATE <code>40001</code> (serialization failure) or <code>40P01</code> (deadlock), automatically, in the same function that set the isolation level.</strong> Both mean the transaction lost a race and nothing it did survived, so running it again is safe. Callers never see them.</p>
+<pre data-lang="plain">retrying transaction = attempt 0
+  where
+    attempt n =
+      run transaction `catch` \err -&gt;
+        if sqlstate err `elem` ["40001", "40P01"]
+          then do
+            logWarning (retryMessage (n + 1) (sqlstate err))
+            sleep =&lt;&lt; randomBetween 0 (min 30ms (3ms * 2^n))
+            attempt (n + 1)
+          else throw err</pre>
+    <ul>
+      <li><strong>Randomize the wait.</strong> A fixed backoff puts the two transactions that just conflicted back in step, and they conflict again.</li>
+      <li><strong>Do not cap the attempts.</strong> The work has to happen; the request's own timeout is the bound.</li>
+      <li><strong>Log every retry, but do not alert on it.</strong> The warning makes contention visible on a dashboard. An alert on <code>40001</code> fires on something that already healed.</li>
+      <li><strong>Retry infrastructure errors separately and more carefully.</strong> A dropped connection or a failover may have happened after the commit, so only writes that are safe to replay, or carry an <a href="#idempotency">idempotency key</a>, retry those, a few times with jitter. An exhausted pool is not retried: waiting longer would only make it worse.</li>
+    </ul>
+
+    <h2 id="side-effects">No side effects in a transaction</h2>
+    <p><strong>Never call another system from application code while a transaction is open.</strong> No HTTP request, no email, no message to an external broker. There are three reasons:</p>
+    <ul>
+      <li>The retry above runs the transaction body again, so a side effect inside it happens twice.</li>
+      <li>If the transaction rolls back, the call cannot be taken back: the provider charged the card, but the database has no payment.</li>
+      <li>While the call waits on the network, the transaction holds its row locks and its snapshot, so other writers queue behind it and vacuum cannot clean up.</li>
+    </ul>
+    <p>Make it impossible rather than discouraged. In Haskell, our transactions are values of hasql's <code>Transaction</code> type, which cannot perform IO, so an HTTP call inside one does not compile. In other languages, keep the transaction in a function that takes only the database handle.</p>
+    <p>Instead, the transaction records what has to happen, and something else does it after the commit:</p>
+    <ul>
+      <li><strong>Enqueue a job</strong> in the same transaction as the data it is about (<a href="#queues">below</a>). A request that starts a payment writes the payment and its job, commits, and returns; a worker calls the provider.</li>
+      <li><strong>Queue messages in the database</strong>, in a table or a <a href="lifecycles.html#queue">pgmq queue</a>, and let a worker deliver them. Statechart callbacks work this way: they run inside the transaction, so they only ever queue.</li>
+      <li><strong>When the database must hold a reference to something written elsewhere</strong>, write the external side first, idempotently, then commit the reference. A crash in between leaves an unused item outside, which is harmless, rather than a reference to nothing.</li>
+    </ul>
+
+    <h2 id="queues">Work queues</h2>
+    <p><strong>Keep the job queue in PostgreSQL</strong>, so a job commits or rolls back with the data that caused it. Three habits make it safe to run many workers:</p>
+    <ul>
+      <li><strong>Claim with <code>for update skip locked</code>.</strong> Each worker takes rows nobody else holds, without waiting:
+<pre data-lang="sql">with available as (
+    select id
+    from job_queue.payload
+    order by priority desc
+    for update skip locked
+    limit 10
+)
+delete from job_queue.payload p
+using available a
+where p.id = a.id
+returning p.*;</pre></li>
+      <li><strong>Wake workers with <code>LISTEN</code>/<code>NOTIFY</code></strong> instead of polling: a statement-level trigger on the queue table calls <code>pg_notify('job_created', null)</code>, once per insert statement rather than once per row.</li>
+      <li><strong>Retry failed jobs with backoff and a maximum number of attempts</strong>, recorded on the job. A job that needs to run alone takes <code>pg_try_advisory_xact_lock</code> on its key and gives way if it cannot.</li>
+    </ul>
+    <p>Queue tables churn: every job is inserted and deleted. Vacuum them on a row count rather than a fraction of the table:</p>
+<pre data-lang="sql">alter table job_queue.payload set (
+    autovacuum_vacuum_scale_factor = 0,
+    autovacuum_vacuum_threshold = 1000,
+    autovacuum_vacuum_insert_threshold = 1000
+);</pre>
+
+    <h2 id="idempotency">Idempotent writes</h2>
+    <p><strong>Every write a client may retry carries an idempotency key</strong>, reserved in the same transaction as the write, with <code>insert … on conflict</code>. The first request runs and stores its response; a repeat gets the stored response.</p>
+    <p>One detail matters at <code>SERIALIZABLE</code>. Looking a key up before inserting it takes a read lock on the index page where the key would go, and every concurrent request inserts its own key into that same page. Requests with different keys then abort each other with <code>40001</code>. Reserve the key with <code>on conflict</code> instead, whose uniqueness check takes no read lock, and look only in older partitions for keys that may already exist.</p>
+    <p>Incoming webhooks follow the same pattern: each is stored as a row first, and a trigger enqueues the job that processes it, so receiving one is a fast insert and a failure while processing it is retried like any other job. Statecharts ignore <a href="lifecycles.html#late">late and duplicate events</a>, so a provider that sends the same notification twice moves nothing twice.</p>
+
+    <h2 id="timeouts">A timeout on everything</h2>
+    <p><strong>Each service connects as its own role, and each role has a <code>statement_timeout</code></strong> that fits its work:</p>
+    <div class="table-wrap">
+    <table class="plain">
+      <thead><tr><th>Role</th><th><code>statement_timeout</code></th></tr></thead>
+      <tbody>
+        <tr><td>Claiming jobs from the queue</td><td>1 s</td></tr>
+        <tr><td>Command-line tools</td><td>1.5 s</td></tr>
+        <tr><td>Merchant portal</td><td>3 s</td></tr>
+        <tr><td>Replica reads (exports, reports)</td><td>10 s</td></tr>
+        <tr><td>Workers</td><td>20 s</td></tr>
+        <tr><td>GraphQL reads</td><td>30 s</td></tr>
+      </tbody>
+    </table>
+    </div>
+<pre data-lang="sql">-- both in milliseconds
+alter role portal_service set statement_timeout = 3000;
+alter role portal_service set idle_in_transaction_session_timeout = 900;</pre>
+    <ul>
+      <li><strong><code>idle_in_transaction_session_timeout</code> of 900 ms</strong> ends a session that opened a transaction and stopped talking. The transaction it was holding open would otherwise keep its locks, and stop vacuum from cleaning up rows.</li>
+      <li><strong><code>lock_timeout</code> of 50 ms</strong> in every migration (<a href="pipeline.html#locks">why</a>), and in any function or trigger that takes a strong lock: <code>set local lock_timeout to '50ms'</code>. Waiting for a lock is how one slow transaction stalls everything queued behind it; giving up and retrying is cheaper.</li>
+    </ul>
+
+    <h2 id="connections">Connections</h2>
+    <ul>
+      <li><strong>Pool with pgbouncer in transaction mode</strong>, with a pool size per role. A worker keeps separate pools for listening, claiming jobs, writing and reading from a replica, so a burst of one kind of work cannot take the connections another needs.</li>
+      <li><strong>Turn prepared statements off in one place</strong> for every pool behind a transaction-mode pgbouncer, rather than at each call site.</li>
+      <li><strong>Read from a replica</strong> for exports and reports, at <code>REPEATABLE READ</code>.</li>
+      <li><strong>Give each kind of work its own role</strong> with only the grants it needs (<a href="architecture.html#roles">roles per duty</a>). The GraphQL layer connects read-only.</li>
+      <li><strong>Pin <code>search_path</code> on every <code>security definer</code> function</strong>: <code>set search_path = pg_catalog, public</code>. Otherwise a caller can put its own schema first and change what the function calls.</li>
+      <li><strong>Use row-level security</strong> where a table holds data that must never cross tenants, such as card data, with a policy on a setting the transaction sets.</li>
+    </ul>
+
+    <h2 id="data">Types that carry rules</h2>
+    <ul>
+      <li><strong>Money is an integer of minor units</strong>, in a domain: <code>create domain currency_unit as bigint</code>. No rounding, no floating point, and the type says what the number is.</li>
+      <li><strong>Bounded text is a domain</strong> (<code>text_100</code>), so a limit is declared once and every column that uses it agrees.</li>
+      <li><strong>Timestamps are <code>timestamptz</code></strong>, defaulting to <code>clock_timestamp()</code>.</li>
+      <li><strong>Identifiers are <code>uuidv7()</code></strong> on PostgreSQL 18: unique without coordination, and time-ordered, so new rows land at the end of the index instead of all over it.</li>
+      <li><strong>A set of values that changes is a lookup table with a foreign key</strong>, not an enum. Removing or renaming an enum value is a migration of every table that uses it.</li>
+      <li><strong>Every table and column has a <code>comment on</code></strong>, required by the table template (<a href="architecture.html#comments">why</a>).</li>
+    </ul>
+
+    <h2 id="performance">Staying fast</h2>
+    <ul>
+      <li><strong>Never wrap an indexed column in a cast or function call in a predicate.</strong> <code>where id::text = payment_reference</code> cannot use the index on <code>id</code>, and a trigger written that way caused an outage. Cast the other side instead; sqint's <code>index/cast-on-column</code> catches it in review.</li>
+      <li><strong>Index whatever a callback looks up.</strong> A statechart callback finds its row by <code>state_machine_id</code> on every transition; without an index that is a sequential scan per transition, which on a payments table is an outage. Lead the index with that column.</li>
+      <li><strong>Keep events proportional to work.</strong> The statechart event log is never purged, so nothing should send events on a timer for rows that are not changing.</li>
+      <li><strong>Move long backfills out of the deploy.</strong> A deploy registers the backfill and returns; a job runs it afterwards in keyset batches, paced, and throttled when replicas fall behind. One four-hour backfill run inline took a third of the database's time and made claiming a job go from 340 µs to 16 ms.</li>
+      <li><strong>Partition tables that grow with time</strong> (webhooks by month, idempotency keys by day) with pg_partman, so queries and vacuum work on the recent partition instead of the whole history.</li>
+      <li><strong>Tune autovacuum per table, with the reason in a comment</strong>: hot tables on a fixed row threshold, as the queue above.</li>
+    </ul>
+
+    <h2 id="observability">Seeing what happened</h2>
+    <ul>
+      <li><strong>Every write sets the request id and trace context</strong> as transaction-local settings, through the same function that sets the isolation level. Triggers and functions can read them, and every job enqueued in the transaction copies them, so a payment can be followed from the HTTP request through the jobs it caused.</li>
+      <li><strong>Each statement gets a tracing span with its SQL text and never its parameters</strong>, which may hold personal or card data.</li>
+      <li><strong>Log what is slow or blocked</strong>: <code>log_min_duration_statement = 20</code> (ms), <code>log_lock_waits = on</code>, <code>track_io_timing = on</code>, and <code>pg_stat_statements</code> with <code>track = all</code>, so statements inside functions are counted too.</li>
+    </ul>
+
+    <h2 id="testing">Testing against PostgreSQL</h2>
+    <ul>
+      <li><strong>Test against a real PostgreSQL</strong>, never a mock: integration tests run the services against a database deployed from the plan, and database functions have pgTAP tests run with <code>pg_prove</code>.</li>
+      <li><strong>Test races on purpose.</strong> A test that runs two requests for the same payment at once is the only way to see that serializable and the retry actually hold.</li>
+      <li><strong>Prepare every query against the new schema in CI</strong>, from both the code being merged and the code running in production (<a href="tools.html#hasql-check">hasql-check</a>), and lint every migration (<a href="tools.html#sqint">sqint</a>). <a href="pipeline.html#ci">Shipping safely</a> has the whole pipeline.</li>
+    </ul>
+
+    <div class="next">
+      <a href="lifecycles.html">Lifecycles</a>
+      <a href="agents.html">Next: for agents</a>
+    </div>
+  </article>
+</main>
+
+<footer>
+  <div class="inner">
+    <p>Built and used at <a href="https://kronor.io">Kronor</a>. Every tool is on <a href="https://github.com/kronor-io">github.com/kronor-io</a>.</p>
+    <p><a href="https://sqitch.org">sqitch</a> is by David E. Wheeler and is not part of this project.</p>
+  </div>
+</footer>
+<script src="assets/highlight.js" defer></script>
+</body>
+</html>
