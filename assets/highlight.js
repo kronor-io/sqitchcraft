@@ -167,13 +167,23 @@
     ]);
   }
 
+  const HS_KEYWORDS = words(`
+    where let in do case of if then else module import qualified as hiding
+    data type newtype class instance deriving forall mdo`);
+
   function hs(text) {
     return tokenize(text, [
       [g(String.raw`--.*`), "c"],
       [g(String.raw`"(?:[^"\\]|\\.)*"`), "s"],
-      [g(String.raw`<-|->|\\|\.(?=\s)`), "k"],
+      [g(String.raw`'(?:[^'\\]|\\.)'`), "s"],
+      [g(String.raw`<-|->|=>|::|\\|\.(?=\s)`), "k"],
+      [g(String.raw`\x60[\w.']+\x60`), "fn"],
+      [g(String.raw`\b\d[\d_]*(?:\.\d+)?\b`), "n"],
+      // A name defined at the start of a line, as in a signature or equation.
+      [g(String.raw`^[a-z_][\w']*(?=\s+(?:::|[\w\s]*=(?!=)))`), "fn"],
       [g(String.raw`\b[A-Z][\w]*(?:\.[A-Z][\w]*)*\.?[a-z]\w*`), "fn"],
       [g(String.raw`\b[A-Z][\w.]*`), "t"],
+      [g(String.raw`\b[a-z_][\w']*`), (t) => HS_KEYWORDS.has(t) ? span("k", t) : esc(t)],
     ]);
   }
 

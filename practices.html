@@ -79,16 +79,22 @@ end;</pre>
 
     <h2 id="retries">Retry what lost a race</h2>
     <p><strong>Retry a transaction that fails with SQLSTATE <code>40001</code> (serialization failure) or <code>40P01</code> (deadlock), automatically, in the same function that set the isolation level.</strong> Both mean the transaction lost a race and nothing it did survived, so running it again is safe. Callers never see them.</p>
-<pre data-lang="plain">retrying transaction = attempt 0
+<pre data-lang="hs">retrying :: Transaction a -&gt; Session a
+retrying transaction = attempt 0
   where
     attempt n =
-      run transaction `catch` \err -&gt;
-        if sqlstate err `elem` ["40001", "40P01"]
-          then do
-            logWarning (retryMessage (n + 1) (sqlstate err))
-            sleep =&lt;&lt; randomBetween 0 (min 30ms (3ms * 2^n))
-            attempt (n + 1)
-          else throw err</pre>
+        catchError (run transaction) \err -&gt;
+            case sqlState err of
+                Just code | code `elem` ["40001", "40P01"] -&gt; do
+                    liftIO do
+                        logWarning (retryMessage (n + 1) code)
+                        threadDelay =&lt;&lt; randomRIO (0, maxDelay n)
+                    attempt (n + 1)
+                _ -&gt; throwError err
+
+    -- microseconds: uniform in [0, min 30 ms (3 ms * 2^n)]
+    maxDelay n = min 30_000 (3_000 * 2 ^ min 4 n)</pre>
+    <p>In Haskell, <a href="https://hackage.haskell.org/package/hasql-transaction">hasql-transaction</a> does this for you: its <code>transaction</code> session retries on <code>40001</code> and <code>40P01</code> until the transaction commits. It retries at once, though, without waiting between attempts. To add the randomized wait and the log line, wrap <code>transactionNoRetry</code>, which runs the transaction once, as above.</p>
     <ul>
       <li><strong>Randomize the wait.</strong> A fixed backoff puts the two transactions that just conflicted back in step, and they conflict again.</li>
       <li><strong>Do not cap the attempts.</strong> The work has to happen; the request's own timeout is the bound.</li>
