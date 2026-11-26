@@ -52,7 +52,7 @@
 
   <article>
     <h1>Practices</h1>
-    <p class="lede">Kronor processes payments on one PostgreSQL database that every service shares. These are the habits that keep it fast under load and keep the code around it simple. Most of them are enforced somewhere, in a type, a role setting, a template or a CI check, rather than left to memory.</p>
+    <p class="lede">These are the habits Kronor follows to keep a busy PostgreSQL database fast under load and keep the code around it simple. Most of them are enforced somewhere, in a type, a role setting, a template or a CI check, rather than left to memory.</p>
 
     <h2 id="logic">Logic in the database</h2>
     <p><strong>Put rules where every writer has to pass through them.</strong> Constraints, domains, generated columns, views, functions, triggers and <a href="lifecycles.html">statecharts</a> hold the business logic; services call a narrow set of functions and read views. A rule in one service is a rule every other service can break, and a rule in the database is checked in the same transaction as the write it guards. <a href="architecture.html#rules">Database design</a> sets out the order to prefer them in.</p>
