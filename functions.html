@@ -61,7 +61,7 @@ Added "billing/function/outstanding_for" to database/sqitch.plan</pre>
     <div class="compare">
       <div class="pane">
         <p class="pane-label">deploy/billing/function/outstanding_for.sql</p>
-<pre data-lang="sql">BEGIN;
+<pre data-lang="sql">begin;
 
     create or replace function billing.outstanding_for(email text)
         returns numeric(12,2)
@@ -77,15 +77,15 @@ Added "billing/function/outstanding_for" to database/sqitch.plan</pre>
     comment on function billing.outstanding_for(text) is
       'What a customer still owes across all their unpaid invoices.';
 
-COMMIT;</pre>
+commit;</pre>
       </div>
       <div class="pane">
         <p class="pane-label">verify/billing/function/outstanding_for.sql</p>
-<pre data-lang="sql">BEGIN;
+<pre data-lang="sql">begin;
 
     select billing.outstanding_for('nobody@example.com');
 
-ROLLBACK;</pre>
+rollback;</pre>
         <p class="pane-note">The revert the template wrote is <code>drop function if exists billing.outstanding_for;</code>, which is right for a function that did not exist before.</p>
       </div>
     </div>
@@ -116,7 +116,7 @@ Modify these files as appropriate:
       <div class="pane">
         <p class="pane-label">A rework</p>
         <p class="pane-sub">git diff, deploy/billing/function/outstanding_for.sql</p>
-<pre data-lang="sql">@@ -10,10 +10,11 @@ BEGIN;
+<pre data-lang="sql">@@ -10,10 +10,11 @@ begin;
          select coalesce(sum(amount), 0)
          from billing.invoice
          where customer_email = email
@@ -189,7 +189,7 @@ HINT:  Use DROP FUNCTION billing.outstanding_for(text) first.</pre>
     <p>So the definition drops the old signature and creates the new one, in one transaction so no caller sees neither. Both statements are safe to run again, which a definition must be:</p>
 <pre data-lang="sql">@@ -2,7 +2,11 @@
 
- BEGIN;
+ begin;
 
 <span class="del">-    create or replace function billing.outstanding_for(email text)</span>
 <span class="add">+    -- A new argument is a new function: drop the old one, or both would exist</span>
@@ -200,7 +200,7 @@ HINT:  Use DROP FUNCTION billing.outstanding_for(text) first.</pre>
          returns numeric(12,2)
          language sql
          stable
-@@ -11,10 +15,10 @@ BEGIN;
+@@ -11,10 +15,10 @@ begin;
          from billing.invoice
          where customer_email = email
            and paid_at is null
@@ -217,7 +217,7 @@ HINT:  Use DROP FUNCTION billing.outstanding_for(text) first.</pre>
 <span class="p">$ </span>psql -c "select billing.outstanding_for('ana@example.com')"
 <span class="b">ERROR:  function billing.outstanding_for(unknown) is not unique</span></pre>
       <p>The revert has to drop the new signature first:</p>
-<pre data-lang="sql">  BEGIN;
+<pre data-lang="sql">  begin;
 
 <span class="add">+     drop function if exists billing.outstanding_for(text, date);</span>
 <span class="add">+</span>
@@ -249,7 +249,7 @@ alter table billing.invoice rename column paid_at to settled_at;</pre>
       <div class="pane">
         <p class="pane-label">Redefine it in the migration</p>
         <p class="pane-sub">deploy/migrations/2026/11/…-rename-billing.invoice.settled_at.sql</p>
-<pre data-lang="sql">BEGIN;
+<pre data-lang="sql">begin;
 
   -- Do not remove this line
   select set_config('lock_timeout', '50ms', false);
@@ -272,12 +272,12 @@ alter table billing.invoice rename column paid_at to settled_at;</pre>
         and issued_on &lt;= as_of;
   $$;
 
-COMMIT;</pre>
+commit;</pre>
       </div>
       <div class="pane">
         <p class="pane-label">Rework the definition to match</p>
         <p class="pane-sub">deploy/billing/function/outstanding_for.sql</p>
-<pre data-lang="sql">@@ -14,7 +14,7 @@ BEGIN;
+<pre data-lang="sql">@@ -14,7 +14,7 @@ begin;
          select coalesce(sum(amount), 0)
          from billing.invoice
          where customer_email = email

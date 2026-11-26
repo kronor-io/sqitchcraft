@@ -96,7 +96,7 @@ database/
       <div class="pane">
         <p class="pane-label">A definition</p>
         <p class="pane-sub">deploy/billing/table/invoice.sql: what the object is</p>
-<pre data-lang="sql">BEGIN;
+<pre data-lang="sql">begin;
 
     create table if not exists billing.invoice (
         id bigint generated always as identity primary key,
@@ -114,7 +114,7 @@ database/
     create index if not exists invoice_customer_email
         on billing.invoice (customer_email);
 
-COMMIT;</pre>
+commit;</pre>
         <p class="pane-note">Written as if creating the table today. Its <code>if not exists</code> guards make it safe to run where the table already exists.</p>
       </div>
       <div class="pane">

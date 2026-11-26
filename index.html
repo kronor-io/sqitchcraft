@@ -72,14 +72,14 @@ drop view billing.daily_invoiced;
 alter table billing.invoice alter column amount
   type numeric(12,2) using amount::numeric(12,2);
 create view billing.daily_invoiced as
-SELECT issued_on, sum(amount) AS total
-   FROM billing.invoice GROUP BY issued_on;
+select issued_on, sum(amount) as total
+   from billing.invoice group by issued_on;
 
 <span class="c">-- index billing.invoice_customer_email
 -- outside a transaction</span>
 <span class="w">-- hazard: builds an index</span>
-CREATE INDEX CONCURRENTLY invoice_customer_email
-  ON billing.invoice USING btree (customer_email);</pre>
+create index concurrently invoice_customer_email
+  on billing.invoice using btree (customer_email);</pre>
       </div>
     </div>
     <p class="arrow-note">This is real output, shortened only in the line breaks, from the example project this site follows. sqiff found the view that depends on <code>amount</code> without being told, moved the index into a concurrent build of its own, and named the cost of each step. With <code>--write</code>, it adds these as sqitch changes with reverts.</p>

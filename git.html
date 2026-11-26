@@ -101,7 +101,7 @@
       <div class="pane">
         <p class="pane-label">1. Is this what the table should be?</p>
         <p class="pane-sub">Read the definition's diff.</p>
-<pre data-lang="sql">@@ -5,7 +5,7 @@ BEGIN;
+<pre data-lang="sql">@@ -5,7 +5,7 @@ begin;
      create table if not exists billing.invoice (
          id bigint generated always as identity primary key,
          customer_email text not null,
@@ -146,7 +146,7 @@ create view billing.daily_invoiced as …</pre>
     <h3>What has <code>amount</code> been over time?</h3>
 <pre data-lang="gitout"><span class="p">$ </span>git log -L '/amount /,+1:database/deploy/billing/table/invoice.sql' --format='%h %an %ad %s' --date=short
 0e7d789 Ana Lima 2026-11-25 Store invoice amounts to the cent
-@@ -8,1 +8,1 @@ BEGIN;
+@@ -8,1 +8,1 @@ begin;
 <span class="del">-        amount integer not null,</span>
 <span class="add">+        amount numeric(12,2) not null,</span>
 251c6d2 Ana Lima 2026-03-02 Add invoices and the daily total view

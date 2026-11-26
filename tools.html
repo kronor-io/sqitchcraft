@@ -156,7 +156,7 @@ curl -fsSL "https://github.com/kronor-io/pgfmt/releases/latest/download/pgfmt-$(
 changed=$(git diff --name-only --diff-filter=AM master -- 'database/*.sql' | grep -v @)
 pgfmt $changed            <span class="c"># rewrite them</span>
 pgfmt --check $changed    <span class="c"># or only report them, for CI</span></pre>
-    <p>On the example project's invoice table, with the defaults:</p>
+    <p>On the example project's invoice table, as an older create-migration template wrote it, with upper-case <code>BEGIN;</code>, and with pgfmt's defaults:</p>
 <pre data-lang="sql"><span class="c">-- database/deploy/billing/table/invoice.sql</span>
 <span class="del">-BEGIN;</span>
 <span class="add">+begin;</span>
