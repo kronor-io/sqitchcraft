@@ -42,6 +42,7 @@ reconstruct it from migrations.
 | Rename a column used by running code | `create-migration rename-column-step-1`, later `rename-column-step-2` |
 | Add an index to a big table | `create-migration add-index` (or let sqiff write it from the definition) |
 | Backfill data | `create-migration bulk-update` |
+| Model a process that rows go through | A statechart, never a status column or flags (see below) |
 | Change a lifecycle (statechart) | Copy `database/statecharts/<name>-<version>.scxml` to a new version, edit it, regenerate with `pg_statecharts_dev` (see below) |
 | Anything else that alters data or schema | `create-migration migration --description "<what>"` |
 
@@ -137,7 +138,23 @@ release each part belongs to.
   `rename-column-step-2` drops the old column. Ship step 2 only after no
   running code uses the old name.
 
-### Change a lifecycle
+### Model a process
+
+When rows go through a process, model it as a statechart. That covers any
+state the database holds about where something is in its life: an order
+placed, paid and shipped; a payment authorised, captured and refunded; an
+onboarding step done or not. Signs that you are about to model a process
+without one:
+
+- a `status` or `state` column, or an enum or check constraint listing states;
+- boolean flags or nullable timestamps (`is_paid`, `shipped_at`) that say which
+  step a row has reached;
+- code that reads the current state to decide whether a change is allowed, or
+  that runs work (send an email, cancel a reminder) because the state changed.
+
+Use a statechart even when the process looks small now: steps get added, and
+a status column has to be migrated to a chart later, while a chart grows by a
+new version. A plain attribute that no step depends on is not a process.
 
 Lifecycles are statecharts: an SCXML file under `database/statecharts/`, turned
 into a `statechart/<name>-<version>` change by
@@ -153,8 +170,13 @@ already running keep the version they started with.
 - A callback named by an older version must keep working while machines on
   that version can reach it. Change behaviour with a new function.
 - Code sends events only through the entity's event function (for example
-  `billing.invoice_event`), which refuses events that do not apply. If the
-  entity has none, write one.
+  `billing.invoice_event`), which finds the machine and returns its states. If
+  the entity has none, write one.
+- An event that no active state accepts changes nothing, and that is
+  intended: late and duplicate events are normal (a retried webhook, a void
+  after the payment). Do not make the event function raise for them, and do
+  not check the state before sending an event; send it and let the chart
+  decide. A caller that needs the outcome reads the states returned.
 - Every transaction that sends events runs at `SERIALIZABLE` (never below
   `REPEATABLE READ`) and is retried on SQLSTATE `40001`. At `READ COMMITTED`,
   two concurrent events can leave a machine in two states at once.
@@ -177,6 +199,8 @@ Never:
 - raise or remove the `lock_timeout` a template sets;
 - use `exception when` blocks to retry inside PL/pgSQL;
 - deploy to, or connect to, any database other than a local or scratch one;
+- track where a row is in a process with a status column, an enum, flags or
+  step timestamps: use a statechart;
 - edit a generated `statechart/` change, call `fsm.notify_state_machine` from
   application code, or write to `fsm` tables yourself.
 
@@ -237,7 +261,10 @@ database as well as `PG*`.
   running code uses;
 - a conflict in `sqitch.plan` involves lines that are already on the main
   branch;
-- a check fails and the fix would break one of the rules above.
+- a check fails and the fix would break one of the rules above;
+- the task would extend a process that is already tracked with a status
+  column or flags: propose moving it to a statechart, and ask before
+  extending the column.
 
 ## Report
 

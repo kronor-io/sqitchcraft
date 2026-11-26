@@ -78,6 +78,7 @@
       <tbody>
         <tr><td>Where things are</td><td>The layout, and the instruction to read an object's definition instead of reconstructing it from migrations.</td></tr>
         <tr><td>Choose the workflow</td><td>A table from task to command: create an object, change a table, change a function or view, the multi-release recipes. Commands are given with every flag, because create-migration prompts when one is missing and sqitch opens an editor without <code>-n</code>.</td></tr>
+        <tr><td>Model a process</td><td>When rows go through a process, a <a href="lifecycles.html">statechart</a>, never a status column, enum or flags. The signs that a task is a process, how to change a chart, and that late and duplicate events are left to the chart rather than turned into errors.</td></tr>
         <tr><td>Rules</td><td>The nevers and alwayses from <a href="layout.html">the layout</a>, <a href="functions.html">functions</a> and <a href="pipeline.html">shipping safely</a>, stated without exceptions.</td></tr>
         <tr><td>Merging and rebasing</td><td>The regenerate-don't-merge procedure from <a href="git.html#conflicts">git and review</a>, and why a stale snapshot matters.</td></tr>
         <tr><td>Check before you finish</td><td>One command, and what to do with sqint's findings: fix BLOCKs, never write a <code>lint:ignore</code> itself.</td></tr>

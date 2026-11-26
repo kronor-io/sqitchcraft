@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lifecycles · sqitchcraft</title>
-<meta name="description" content="Why Kronor lets PostgreSQL run an invoice's lifecycle as a statechart: the bugs a status column invites, a chart with callbacks, and real output showing refused events, atomic transitions, a race and the history it keeps.">
+<meta name="description" content="Why Kronor lets PostgreSQL run an invoice's lifecycle as a statechart: the bugs a status column invites, a chart with callbacks, and real output showing late and duplicate events, atomic transitions, a race and the history it keeps.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600&family=Schibsted+Grotesk:wght@400;600;700&display=swap">
@@ -38,7 +38,7 @@
       <li><a href="#chart">The lifecycle as a chart</a></li>
       <li><a href="#callbacks">What each state does</a></li>
       <li><a href="#run">One invoice, start to finish</a></li>
-      <li><a href="#refused">Events that do not apply</a></li>
+      <li><a href="#late">Late and duplicate events</a></li>
       <li><a href="#atomic">One transaction</a></li>
       <li><a href="#race">Two requests at once</a></li>
       <li><a href="#history">The history</a></li>
@@ -241,11 +241,40 @@ $$ language sql;
  t      | t</pre>
     <p><code>pay</code> was defined on <code>open</code> and worked from <code>overdue</code>. Leaving <code>open</code> cancelled the reminder, so the customer gets a receipt and not a reminder for an invoice they just paid. No payment code had to know reminders exist.</p>
 
-    <h2 id="refused">Events that do not apply</h2>
-    <p>The same invoice, now paid, cannot be voided:</p>
-<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');
-ERROR:  invoice 1 is paid, and invoice.void does not apply</pre>
-    <p>That error comes from the wrapper, not the engine. Left to itself, <code>fsm.notify_state_machine</code> drops an event that no active state accepts, and returns as if nothing happened. That suits events that only sometimes matter, and hides mistakes for events that always should. So the application calls one function per entity, which asks <code>fsm.is_valid_transition</code> first and refuses loudly:</p>
+    <h2 id="late">Late and duplicate events</h2>
+    <p>Events arrive late and more than once. The payment provider retries a webhook it thinks we missed; the back office voids an invoice the customer paid a minute earlier. Invoice 1 is paid, and gets both:</p>
+<pre data-lang="shell"><span class="p">=# </span>select billing.invoice_event(1, 'invoice.pay');
+ invoice_event
+---------------
+ paid
+
+<span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');
+ invoice_event
+---------------
+ paid
+
+<span class="p">=# </span>select kind from billing.outbox where invoice_id = 1 order by id;
+   kind
+----------
+ invoice
+ reminder
+ receipt
+
+<span class="p">=# </span>select name, to_char(created_at, 'HH24:MI:SS.MS') as received
+   from fsm.state_machine_event
+   where state_machine_id = (select state_machine_id from billing.invoice where id = 1)
+   order by id;
+          name           |   received
+-------------------------+--------------
+ invoice.issue           | 07:53:23.925
+ invoice.due_date_passed | 07:53:23.935
+ invoice.pay             | 07:53:23.937
+ done.state.paid         | 07:53:23.937
+ invoice.pay             | 07:53:23.942
+ invoice.void            | 07:53:23.943</pre>
+    <p>Neither changed anything. <code>paid</code> has no transitions, so no active state accepts either event: the invoice stays paid, no callback runs, and the customer gets one receipt, not two. Both calls succeed, and both events are in the log with the time they arrived.</p>
+    <p>That is the behaviour we want. A late or repeated event is normal traffic, not a mistake, and raising an error for it would only make every caller catch and ignore it. The webhook handler does not check whether the invoice is already paid, and the void button does not check whether it still can: each sends its event, and the chart decides. A caller that needs to know what happened reads the states the call returns.</p>
+    <p>The application sends events through one function per entity, which finds the machine from the invoice and returns its states afterwards:</p>
     <p class="filename">database/deploy/billing/function/invoice_event.sql</p>
 <pre data-lang="sql">create or replace function billing.invoice_event(invoice_id bigint, event text)
     returns text as
@@ -262,20 +291,19 @@ $$
             raise exception 'invoice % does not exist', invoice_id;
         end if;
 
+        <span class="c">-- An event no active state accepts changes nothing: a webhook</span>
+        <span class="c">-- delivered twice, or a void that arrives after the payment. The</span>
+        <span class="c">-- engine logs it and moves on, and so does this.</span>
+        perform fsm.notify_state_machine(machine_id =&gt; machine, event_name =&gt; event);
+
         select string_agg(state_id, '/' order by entered_at) into current_state
         from fsm.state_machine_state
         where state_machine_id = machine and exited_at is null;
 
-        if not fsm.is_valid_transition(machine_id =&gt; machine, event_name =&gt; event) then
-            raise exception 'invoice % is %, and % does not apply', invoice_id, current_state, event
-                using errcode = 'check_violation';
-        end if;
-
-        perform fsm.notify_state_machine(machine_id =&gt; machine, event_name =&gt; event);
-
-        <span class="c">-- …returns the states the machine is in now</span>
+        return current_state;
     end
 $$ language plpgsql;</pre>
+    <p>An invoice that does not exist is still an error: that is a bug in the caller, not a late event.</p>
 
     <h2 id="atomic">One transaction</h2>
     <p>The transition, its callbacks and everything else the caller did run in one transaction. Pay an invoice and then roll back, the way a failed payment request would:</p>
@@ -308,8 +336,10 @@ ERROR:  could not serialize access due to concurrent update
 Time: 1510.915 ms (00:01.511)
 
 <span class="p">=# </span>select billing.invoice_event(1, 'invoice.void');   <span class="c">-- session B, retried</span>
-ERROR:  invoice 1 is paid, and invoice.void does not apply</pre>
-    <p>The invoice is paid, and only paid. At <code>READ COMMITTED</code>, PostgreSQL's default, the same two events both go through:</p>
+ invoice_event
+---------------
+ paid</pre>
+    <p>The retry is a late event like the ones above: it changes nothing, and the invoice is paid, and only paid. At <code>READ COMMITTED</code>, PostgreSQL's default, the same two events both go through:</p>
 <pre data-lang="shell"><span class="p">=# </span>select state_id from fsm.state_machine_state
    where state_machine_id = 1 and exited_at is null;
  state_id
@@ -339,11 +369,11 @@ ERROR:  invoice 1 is paid, and invoice.void does not apply</pre>
    order by entered_at, state_id;
      state_id     |   entered    |    exited
 ------------------+--------------+--------------
- draft            | 22:02:02.040 | 22:02:02.049
- awaiting_payment | 22:02:02.045 | 22:02:02.053
- open             | 22:02:02.045 | 22:02:02.055
- overdue          | 22:02:02.050 | 22:02:02.055
- paid             | 22:02:02.054 |</pre>
+ draft            | 07:53:23.914 | 07:53:23.932
+ awaiting_payment | 07:53:23.925 | 07:53:23.937
+ open             | 07:53:23.925 | 07:53:23.939
+ overdue          | 07:53:23.935 | 07:53:23.939
+ paid             | 07:53:23.937 |</pre>
     <p>Nobody wrote an audit table, and it cannot drift from the state, because it is the state: the current states are the rows with no <code>exited_at</code>. Questions that used to need an analytics pipeline are one query:</p>
 <pre data-lang="sql"><span class="c">-- How long do invoices stay overdue before they are paid?</span>
 select percentile_cont(0.5) within group (order by exited_at - entered_at)
@@ -433,19 +463,19 @@ INFO:  created new migration: statechart/invoice_flow-1.1.0
 
     <h2 id="cost">What it costs</h2>
     <ul class="verdicts">
-      <li class="yes">The rules live in one file that a reviewer can read, and the database refuses moves the file does not allow.</li>
+      <li class="yes">The rules live in one file that a reviewer can read, and the database makes no move the file does not have.</li>
       <li class="yes">Work that belongs to a state happens on entry or exit, whichever code path got there.</li>
       <li class="yes">The state commits with the data, or not at all. Every service that can send SQL uses the same machine.</li>
       <li class="yes">The history is kept, and it is the same rows as the state.</li>
+      <li class="yes">Late and duplicate events change nothing, so senders do not check the state first and retries are safe.</li>
       <li class="cost">Callbacks run in the caller's transaction. Keep them short and queue anything slow.</li>
       <li class="cost">The engine has no guards. When the next state depends on data, a callback looks at the data and sends the next event.</li>
       <li class="cost">Transitions connect states with the same parent. To leave a compound state from any of its children, put the transition on the compound state, as <code>pay</code> is on <code>open</code>.</li>
       <li class="cost">Every transaction that sends events runs at <code>SERIALIZABLE</code> (at least <code>REPEATABLE READ</code>), and the application retries serialization failures.</li>
-      <li class="cost">An event no state accepts is dropped without an error. A wrapper like <code>billing.invoice_event</code> turns that into one; write one per entity.</li>
       <li class="cost">A chart version lives as long as its oldest running machine.</li>
     </ul>
     <h3>When a status column is enough</h3>
-    <p>A flag that only ever goes from false to true does not need a chart, and neither does a status that nothing reacts to. Statecharts pay for themselves when a lifecycle has moves worth refusing, work attached to its steps, and a history someone will ask about: payments, refunds, orders, onboarding. Start with the entity whose invalid transitions have already cost you an incident.</p>
+    <p>A flag that only ever goes from false to true does not need a chart, and neither does a status that nothing reacts to. Statecharts pay for themselves when a lifecycle has moves that must not happen, work attached to its steps, and a history someone will ask about: payments, refunds, orders, onboarding. Start with the entity whose invalid transitions have already cost you an incident.</p>
 
     <div class="next">
       <a href="architecture.html">Database design</a>

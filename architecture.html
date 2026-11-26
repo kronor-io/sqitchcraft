@@ -81,8 +81,8 @@ comment on schema portal_api is
 
     <h2 id="lifecycles">Lifecycles as statecharts</h2>
     <p>An invoice is drafted, sent, then paid or voided. The usual way to model that is a <code>status</code> column, and the usual result is that every writer has to know which moves are allowed, some of them get it wrong, and the history is overwritten with each update.</p>
-    <p>We model a lifecycle like that as a statechart that PostgreSQL runs with <a href="tools.html#statecharts">pg_statecharts</a>. The chart is an SCXML file in the repository. The database refuses the moves it does not allow, runs a function on entering or leaving a state, commits the new state with the caller's data, and keeps every state a row has been in.</p>
-    <p><a href="lifecycles.html">Lifecycles</a> works through an invoice: the bugs a status column invites, the chart and its callbacks, and real output for refused events, rollbacks, a race between two requests, and a new chart version.</p>
+    <p>We model a lifecycle like that as a statechart that PostgreSQL runs with <a href="tools.html#statecharts">pg_statecharts</a>. The chart is an SCXML file in the repository. The database makes only the moves the chart has and ignores late or repeated events, runs a function on entering or leaving a state, commits the new state with the caller's data, and keeps every state a row has been in.</p>
+    <p><a href="lifecycles.html">Lifecycles</a> works through an invoice: the bugs a status column invites, the chart and its callbacks, and real output for late and duplicate events, rollbacks, a race between two requests, and a new chart version.</p>
 
     <h2 id="roles">Roles per duty</h2>
     <p>Give each kind of work a group role with only the grants it needs, and give each service's login user one of them.</p>

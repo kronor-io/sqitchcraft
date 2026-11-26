@@ -150,6 +150,7 @@ sqint $(git diff --name-only main -- database/deploy)</pre>
     <p>Formats PostgreSQL files without changing what any statement does.</p>
     <p>It reads each file with PostgreSQL's own parser, lays out each statement, and parses the result again: a statement is rewritten only if PostgreSQL sees the same statement afterwards. Comments and blank lines between statements stay byte for byte, and the SQL statements inside PL/pgSQL bodies are formatted too.</p>
 <pre data-lang="shell">nix run github:kronor-io/pgfmt -- --help
+curl -fsSL "https://github.com/kronor-io/pgfmt/releases/latest/download/pgfmt-$(uname -m)-linux.tar.xz" | tar -xJ -C ~/.local
 <span class="c"># the SQL files this branch adds or changes, without rework snapshots</span>
 changed=$(git diff --name-only --diff-filter=AM master -- 'database/*.sql' | grep -v @)
 pgfmt $changed            <span class="c"># rewrite them</span>
@@ -212,7 +213,7 @@ select fsm.notify_state_machine(machine_id => 42, event_name => 'invoice.pay',
                                 data => '{"amount": "120.00"}');
 select fsm.is_state_active(machine_id => 42, state_id => 'paid');</pre>
     <p>Install it with PGXN (<code>pgxn install pg_statecharts</code>), a Debian package, or <code>make install</code>. On development machines, <code>pg_statecharts_dev</code> turns <code>.scxml</code> files into sqitch changes with <code>fsm.gen_statechart_sqitch_migrations</code>; never create it in production. A Haskell SDK generates state and event types from a chart. Projects that deployed the engine as a sqitch project can move to the extension with <code>create extension pg_statecharts version 'sqitch'</code>.</p>
-    <p><a href="lifecycles.html">Lifecycles</a> works through a real invoice chart: callbacks, the wrapper function that every event should go through, and what happens when two requests race.</p>
+    <p><a href="lifecycles.html">Lifecycles</a> works through a real invoice chart: callbacks, the function every event goes through, late and duplicate events, and what happens when two requests race.</p>
 
     <!-- hasql-check -->
     <div class="tool-head" id="hasql-check">
