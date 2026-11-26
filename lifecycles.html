@@ -195,6 +195,37 @@ $$ language sql;
     </ul>
     <p><code>create-migration function statechart</code> writes a callback's skeleton with the payload already unpacked.</p>
 
+    <h3 id="pgmq">The outbox as a queue</h3>
+    <p><code>billing.outbox</code> is a plain table, so the example needs nothing else. A queue inside PostgreSQL, such as <a href="https://github.com/pgmq/pgmq">pgmq</a>, does the same job and gives the worker visibility timeouts, retries and an archive. Its messages are rows too, so they commit or roll back with the event that queued them. The callbacks send to it instead of inserting, and the reminder keeps its message's id so that leaving <code>open</code> can take it back out:</p>
+<pre data-lang="sql">select pgmq.create('billing_email');
+
+<span class="c">-- on_entry of overdue</span>
+create or replace function billing.queue_reminder(event_payload fsm_event_payload)
+    returns void as
+$$
+    update billing.invoice
+    set reminder_msg_id = (select pgmq.send('billing_email',
+            jsonb_build_object('invoice_id', id, 'kind', 'reminder')))
+    where state_machine_id = (event_payload).machine_id;
+$$ language sql;
+
+<span class="c">-- on_exit of open</span>
+create or replace function billing.cancel_reminders(event_payload fsm_event_payload)
+    returns void as
+$$
+    select pgmq.delete('billing_email', reminder_msg_id)
+    from billing.invoice
+    where state_machine_id = (event_payload).machine_id
+      and reminder_msg_id is not null;
+$$ language sql;</pre>
+    <p><code>send_invoice</code> and <code>settle_invoice</code> call <code>pgmq.send</code> the same way. After invoice 1 is issued, goes overdue and is paid, the worker reads:</p>
+<pre data-lang="shell"><span class="p">=# </span>select msg_id, message from pgmq.read('billing_email', vt =&gt; 30, qty =&gt; 10);
+ msg_id |               message
+--------+--------------------------------------
+      1 | {"kind": "invoice", "invoice_id": 1}
+      3 | {"kind": "receipt", "invoice_id": 1}</pre>
+    <p>Message 2, the reminder, was deleted when the payment left <code>open</code>. The worker sends each email and then calls <code>pgmq.archive</code>; a message it does not archive within 30 seconds is read again. A reminder the worker is sending at that moment can still go out, as it could from the outbox table. pgmq is pure SQL, like pg_statecharts, so it installs wherever pg_statecharts does.</p>
+
     <h2 id="run">One invoice, start to finish</h2>
     <p>Inserting an invoice creates its machine and starts it in <code>draft</code> (two triggers, <a href="#repo">below</a>). From then on, the application changes the invoice's state only by sending events, through one function, <code>billing.invoice_event</code>, which returns the states the machine is in afterwards:</p>
 <pre data-lang="shell"><span class="p">=# </span>insert into billing.invoice (customer_email, amount, due_on)
