@@ -466,9 +466,11 @@ pre .dim { opacity: 0.55; }
 }
 .hero-split .about {
   max-width: 62ch;
-  margin: 0 0 2.25rem;
+  margin: 3.5rem 0 0;
   padding-left: 1rem;
   border-left: 3px solid var(--ink);
+  font-size: var(--step-1);
+  line-height: 1.45;
 }
 .hero-split h1 { max-width: 22ch; font-size: clamp(2.4rem, 5.5vw, 4.25rem); }
 .hero-split .lede {
