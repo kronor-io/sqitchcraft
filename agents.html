@@ -40,7 +40,6 @@
       <li><a href="#contents">What the file says</a></li>
       <li><a href="#check">The check script</a></li>
       <li><a href="#guardrails">Guardrails outside the file</a></li>
-      <li><a href="#tested">We tried it</a></li>
       <li><a href="#file">The file</a></li>
     </ul>
   </nav>
@@ -115,28 +114,6 @@ Deploying changes to db:pg:check_database_scratch
       <li><strong>No production credentials.</strong> The agent's environment should reach a local or scratch PostgreSQL and nothing else. Keep production targets out of <code>sqitch.conf</code>; let your deploy pipeline hold them.</li>
       <li><strong>The pre-commit hooks</strong> from <a href="pipeline.html#precommit">shipping safely</a> catch edited snapshots and rewritten plan lines whoever makes them.</li>
       <li><strong>Review stays human.</strong> The agent's report is written for the reviewer: hazards first, then the checks. A pull request that changes the schema still needs a person to accept its costs.</li>
-    </ul>
-
-    <h2 id="tested">We tried it</h2>
-    <p>We gave Codex the example project from this site with the file at its root, and one task, phrased the way a product owner would:</p>
-    <div class="story">
-      <p>"Invoices can now be in different currencies. Add a currency to <code>billing.invoice</code>: a three-letter ISO code, required. Every existing invoice is in SEK. Then <code>billing.outstanding_for</code> should report what a customer owes in one currency, SEK unless the caller says otherwise. Make the database change on a new branch and commit it."</p>
-    </div>
-    <p>It is a hard task on purpose: a required column on a table with rows, and a new argument on a function that already has two. Codex was not told about any of the tools. What it did:</p>
-    <ul class="verdicts">
-      <li class="yes">Read the definitions, not the migrations, and chose <code>create-migration non-nullable-column</code> for the column.</li>
-      <li class="yes">Set the default to <code>'SEK'</code> in the first step, so new inserts set the column before the <code>not valid</code> check starts rejecting them.</li>
-      <li class="yes">Added the format check <code>not valid</code> and validated it in its own change.</li>
-      <li class="yes">Reworked the table and the function after the migrations, with one shared tag.</li>
-      <li class="yes">Dropped the old <code>(text, date)</code> signature in the definition, gave the new argument a default, and added a drop of the new signature to the revert script.</li>
-      <li class="yes">Ran <code>scripts/check-database</code>, left sqint's warning for a human instead of suppressing it, and ended with the report in the four parts the file asks for.</li>
-    </ul>
-    <p>We checked the result independently: the check passes, including reverting and redeploying all nine of its changes; the two existing invoices are SEK; and the function returns 120.50 in SEK and 0 in EUR for the same customer.</p>
-    <p>The trial also taught us three things, and the file now says them:</p>
-    <ul class="verdicts">
-      <li class="cost"><strong>sqiff and the batched recipes.</strong> After the recipe, Codex ran <code>sqiff table</code>, which replays the branch's earlier changes in one transaction and stopped at the backfill's <code>COMMIT</code> with <code>invalid transaction termination</code>. Codex fell back to <code>sqitch rework</code> on its own, which was right. We fixed sqiff so its replay leaves the backfill's commits out (0.1.3.0), and the file says to use <code>sqitch rework</code> with older versions.</li>
-      <li class="cost"><strong>A parameter named like a column.</strong> It named the new argument <code>currency</code>, like the column, and had to refer to it as <code>$3</code>. In a SQL function the column wins, so the file now says to qualify or rename.</li>
-      <li class="cost"><strong>Backfills.</strong> The first version told agents to stop and ask before backfilling a table they could not size. Codex went ahead, and on reflection that is the right default for a batched backfill. The file now asks for every backfill to be listed in the report instead, with whether the table's size is known.</li>
     </ul>
 
     <h2 id="file">The file</h2>
