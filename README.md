@@ -1,7 +1,7 @@
 # sqitchcraft
 
 The guide at https://kronor-io.github.io/sqitchcraft/: how Kronor keeps a
-PostgreSQL schema in sqitch, and how sqiff, sqint, pgfmt, create-migration
+PostgreSQL schema in sqitch, and how sqiff, sqint, pgstyle, create-migration
 (sqitch-with-templates), psql-retry, statecharts, hasql-check and sqitch-plan
 work together. Plain HTML, one stylesheet, Google Fonts; no build step. GitHub
 Pages serves the main branch as it is.
@@ -40,8 +40,8 @@ sqitch 1.5.2 and PostgreSQL 18. Long lines and paths are shortened.
 
 `lifecycles.html` was captured from a second example project, `invoices`: an
 invoice table whose lifecycle is an `invoice_flow` statechart, run with
-pg_statecharts 0.2.0 on PostgreSQL 18 and deployed with sqitch. The pgfmt
-example on `tools.html` is pgfmt's output on the first project.
+pg_statecharts 0.2.0 on PostgreSQL 18 and deployed with sqitch. The pgstyle
+example on `tools.html` is pgstyle's output on the first project.
 
 Not captured, and written from the tools' READMEs: the hasql-check examples
 and the GitHub Actions workflow. The two

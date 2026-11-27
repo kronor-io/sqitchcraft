@@ -4,7 +4,7 @@
 #   scripts/check-database [BASE]      BASE defaults to master
 #
 # 1. sqint's static pass on every deploy script the branch adds or changes.
-#    pgfmt --check on every SQL file it adds or changes, if pgfmt is installed.
+#    pgstyle --check on every SQL file it adds or changes, if pgstyle is installed.
 # 2. sqitch.plan only grows, and no rework snapshot is edited.
 # 3. The whole plan deployed into a fresh scratch database.
 # 4. The branch's own changes reverted and deployed again.
@@ -26,18 +26,18 @@ else
   echo "no deploy scripts changed"
 fi
 
-echo "== pgfmt: SQL files changed since $base"
-if command -v pgfmt >/dev/null; then
+echo "== pgstyle: SQL files changed since $base"
+if command -v pgstyle >/dev/null; then
   # Rework snapshots (name@tag.sql) keep the text that was deployed.
   sql=$(git diff --name-only --diff-filter=AM "$base" -- database | grep '\.sql$' | grep -v @ || true)
   if [ -n "$sql" ]; then
     # shellcheck disable=SC2086
-    pgfmt --check $sql
+    pgstyle --check $sql
   else
     echo "no SQL files changed"
   fi
 else
-  echo "pgfmt is not installed; skipped"
+  echo "pgstyle is not installed; skipped"
 fi
 
 echo "== the plan only grows"
